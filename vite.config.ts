@@ -25,8 +25,8 @@ export default defineConfig({
 function ollamaSolutionPlugin() {
   return {
     name: 'ollama-solution-api',
-    configureServer(server) {
-      server.middlewares.use('/ollama/solution', async (request, response) => {
+    configureServer(server:any) {
+      server.middlewares.use('/ollama/solution', async (request :any, response:any) => {
         if (request.method !== 'POST') {
           response.statusCode = 405;
           response.setHeader('Content-Type', 'application/json');
@@ -34,20 +34,15 @@ function ollamaSolutionPlugin() {
           return;
         }
 
-        const model = process.env.OLLAMA_MODEL;
-        if (!model) {
-          response.statusCode = 500;
-          response.setHeader('Content-Type', 'application/json');
-          response.end(JSON.stringify({ error: 'Set OLLAMA_MODEL before starting the dev server.' }));
-          return;
-        }
+        // Use env model or default to 'llama' if not set.
+        const model = process.env.OLLAMA_MODEL ?? 'llama';
 
         try {
           const body = await readJsonBody(request);
           const prompt = buildDeepSeekPrompt(body);
           const { execFile } = require('child_process');
 
-          execFile('ollama', ['generate', model, '--prompt', prompt], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+          execFile('ollama', ['generate', model, '--prompt', prompt], { maxBuffer: 10 * 1024 * 1024 }, (err:any, stdout:any, stderr:any) => {
             if (err) {
               response.statusCode = 500;
               response.setHeader('Content-Type', 'application/json');
@@ -69,10 +64,10 @@ function ollamaSolutionPlugin() {
   };
 }
 
-function readJsonBody(request) {
+function readJsonBody(request: any): Promise<any> {
   return new Promise((resolve, reject) => {
     let body = '';
-    request.on('data', (chunk) => {
+    request.on('data', (chunk: any) => {
       body += chunk;
     });
     request.on('end', () => {
@@ -86,7 +81,7 @@ function readJsonBody(request) {
   });
 }
 
-function buildDeepSeekPrompt(problem) {
+function buildDeepSeekPrompt(problem: any): string {
   return [
     `Title: ${problem.title ?? ''}`,
     `LeetCode ID: ${problem.id ?? ''}`,
@@ -103,7 +98,7 @@ function buildDeepSeekPrompt(problem) {
   ].join('\n');
 }
 
-function stripMarkdownCodeFence(content) {
+function stripMarkdownCodeFence(content: string): string {
   return content
     .trim()
     .replace(/^```(?:javascript|js)?\s*/i, '')
