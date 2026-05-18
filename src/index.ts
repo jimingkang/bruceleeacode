@@ -91,6 +91,18 @@ type CategoryNode = {
   }>;
 };
 
+class TreeNode {
+  val: unknown;
+  left: TreeNode | null;
+  right: TreeNode | null;
+
+  constructor(val: unknown = 0, left: TreeNode | null = null, right: TreeNode | null = null) {
+    this.val = val;
+    this.left = left;
+    this.right = right;
+  }
+}
+
 const defaultProblems: Problem[] = [
   {
     id: 1,
@@ -219,6 +231,8 @@ const defaultProblems: Problem[] = [
 ];
 
 let problems: Problem[] = [...defaultProblems];
+// Store raw assistant text responses per problem so the output panel can show the assistant text
+const assistantTextByProblem = new Map<string, string>();
 const starterCode = problems[0].code;
 const defaultArgs = problems[0].args;
 let searchRequestId = 0;
@@ -343,6 +357,11 @@ app.innerHTML = `
         </div>
       </div>
       <div id="problemList" class="problem-list" aria-label="LeetCode problem results"></div>
+
+      <section class="panel-block">
+        <h2>Output</h2>
+        <div id="outputPanel" class="output">No output yet.</div>
+      </section>
     </aside>
 
     <section class="workspace">
@@ -384,10 +403,6 @@ app.innerHTML = `
         <div id="variablesPanel" class="variables empty">Run to inspect variables at a breakpoint.</div>
       </section>
 
-      <section class="panel-block">
-        <h2>Output</h2>
-        <pre id="outputPanel" class="output">No output yet.</pre>
-      </section>
     </aside>
 
   </main>
@@ -406,7 +421,7 @@ const stopButton = requiredElement<HTMLButtonElement>('#stopButton');
 const stateText = requiredElement<HTMLElement>('#stateText');
 const lineText = requiredElement<HTMLElement>('#lineText');
 const variablesPanel = requiredElement<HTMLDivElement>('#variablesPanel');
-const outputPanel = requiredElement<HTMLPreElement>('#outputPanel');
+const outputPanel = requiredElement<HTMLDivElement>('#outputPanel');
 
 argsInput.value = defaultArgs;
 let selectedProblemId = problems[0].id;
@@ -430,6 +445,28 @@ let activeLineDecorations: string[] = [];
 let resumeCurrentPause: (() => void) | null = null;
 let resumeMode: ResumeMode = 'continue';
 let stopped = false;
+let currentDebugVariables: Record<string, unknown> | null = null;
+
+monaco.languages.registerHoverProvider('javascript', {
+  provideHover(model, position) {
+    if (!currentDebugVariables) {
+      return null;
+    }
+
+    const word = model.getWordAtPosition(position);
+    if (!word || !(word.word in currentDebugVariables)) {
+      return null;
+    }
+
+    return {
+      range: new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn),
+      contents: [
+        { value: `**${word.word}**` },
+        { value: `\`\`\`json\n${formatHoverValue(currentDebugVariables[word.word])}\n\`\`\`` },
+      ],
+    };
+  },
+});
 
 function renderBreakpoints() {
   breakpointDecorations = editor.deltaDecorations(
@@ -726,7 +763,39 @@ async function loadProblem(problem: Problem) {
     resetBreakpoints();
   }
 
-  outputPanel.textContent = getProblemLoadMessage(loadedProblem);
+  // Include problem description (from LeetCode GraphQL) above any assistant text or status message.
+  const desc = loadedProblem.description ? `${formatProblemDescription(loadedProblem.description)}\n\n` : '';
+  try {
+    const assistantKey = loadedProblem.titleSlug ?? String(loadedProblem.id);
+    const assistantText = assistantTextByProblem.get(assistantKey);
+    if (assistantText) {
+      let movedAssistantCode = false;
+      try {
+        const extracted = extractAssistantJavaScript(assistantText || '');
+        if (extracted && extracted.trim()) {
+          const normalized = normalizeLeetCodeJavaScript(extracted);
+          editor.setValue(normalized);
+          resetBreakpoints();
+          movedAssistantCode = true;
+
+          // Update loadedProblem so state and caching reflect the inserted code
+          loadedProblem.code = normalized;
+          loadedProblem.source = 'deepseek';
+          loadedProblem.isStarter = false;
+        }
+      } catch (e) {
+        // ignore extraction errors
+      }
+
+      renderOutputWithImages(desc + (movedAssistantCode ? getProblemLoadMessage(loadedProblem) : assistantText));
+    } else {
+      renderOutputWithImages(desc + getProblemLoadMessage(loadedProblem));
+    }
+  } catch (e) {
+    // fallback to message-only if anything goes wrong
+    renderOutputWithImages(desc + getProblemLoadMessage(loadedProblem));
+  }
+
   cacheLoadedProblem(loadedProblem);
   renderProblemList(problems);
 }
@@ -825,11 +894,151 @@ async function fetchAlfaOfficialSolutionCode(titleSlug: string) {
   return null;
 }
 
+function buildDeepSeekPrompt(problem: Problem): string {
+  return [
+    `Title: ${problem.title ?? ''}`,
+    `LeetCode ID: ${problem.id ?? ''}`,
+    `Slug: ${problem.titleSlug ?? ''}`,
+    `Difficulty: ${problem.difficulty ?? ''}`,
+    `Tags: ${(problem.tags ?? []).join(', ')}`,
+    `Function arguments JSON example: ${problem.args ?? '[]'}`,
+    '',
+    'Problem description:',
+    problem.description ?? '',
+    '',
+    'Starter code:',
+    problem.code ?? '',
+  ].join('\n');
+}
+
 async function fetchDeepSeekSolution(problem: Problem) {
-  // Try Ollama first (local ollama CLI / server must be available and OLLAMA_MODEL set in dev server)
-  outputPanel.textContent = 'Generating JavaScript solution with Ollama...';
+  // Use the same-origin proxy so the browser never sends CORS preflight requests to Ollama directly.
+  outputPanel.textContent = 'Generating leetcode JavaScript solution with Ollama...';
+
+  const prompt = buildDeepSeekPrompt(problem);
+
+  const endpoints = [
+    '/api/chat',
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const isChat = url.endsWith('/api/chat');
+      const requestBody = isChat
+        ? { model: (window as any).OLLAMA_MODEL ?? 'llama3.2:latest', messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 1500 }
+        : { model: (window as any).OLLAMA_MODEL ?? 'llama3.2:latest', prompt, temperature: 0.2, max_tokens: 1500 };
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!resp.ok) {
+        console.warn(`Ollama endpoint ${url} returned ${resp.status}`);
+        continue;
+      }
+
+      let content = '';
+
+      // Handle streaming NDJSON/chunked JSON responses (common for API chat endpoints)
+      if (resp.body && typeof resp.body.getReader === 'function') {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const json = JSON.parse(trimmed);
+              const chunk =
+                json.message?.content ?? json.output ?? json.text ?? json.content ?? json.data ??
+                (Array.isArray(json.choices) && (json.choices[0]?.message?.content ?? json.choices[0]?.content ?? json.choices[0]?.text)) ??
+                (Array.isArray(json.results) && json.results[0]?.content) ?? '';
+
+              if (chunk) {
+                content += String(chunk);
+                // show streaming progress briefly
+                try {
+                  outputPanel.textContent = 'Generating (streaming)...\n' + content.slice(0, 1000);
+                } catch {}
+              }
+
+              if (json.done) {
+                // if server signals done, can break early
+                // continue reading to drain stream until done is true and stream ends
+              }
+            } catch (e) {
+              // partial JSON chunk — ignore
+            }
+          }
+        }
+
+        // leftover buffer
+        if (buffer.trim()) {
+          try {
+            const json = JSON.parse(buffer.trim());
+            const chunk =
+              json.message?.content ?? json.output ?? json.text ?? json.content ?? json.data ??
+              (Array.isArray(json.choices) && (json.choices[0]?.message?.content ?? json.choices[0]?.content ?? json.choices[0]?.text)) ??
+              (Array.isArray(json.results) && json.results[0]?.content) ?? '';
+            if (chunk) content += String(chunk);
+          } catch (e) {
+            // ignore
+          }
+        }
+      } else {
+        const text = await resp.text();
+        try {
+          const json = JSON.parse(text);
+          content = json.output ?? json.text ?? json.content ?? json.data ?? '';
+          if (!content) {
+            if (Array.isArray(json.choices) && json.choices[0]) {
+              content = json.choices[0].content ?? json.choices[0].text ?? json.choices[0].message?.content ?? '';
+            }
+            if (!content && Array.isArray(json.results) && json.results[0]) {
+              content = json.results[0].content ?? json.results[0].text ?? '';
+            }
+            if (!content && json.choices?.[0]?.message?.content) {
+              content = json.choices[0].message.content;
+            }
+          }
+        } catch (e) {
+          content = text;
+        }
+      }
+
+      if (content && String(content).trim()) {
+        const raw = String(content).trim();
+        // save raw assistant text for later display in the output panel
+        try {
+          const key = (problem.titleSlug ?? String(problem.id));
+          assistantTextByProblem.set(key, raw);
+        } catch (e) {
+          // ignore
+        }
+
+        const code = extractAssistantJavaScript(raw);
+        return code;
+      }
+    } catch (err) {
+      console.warn('Ollama request failed for', url, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Fallback: call local Vite middleware that invokes the ollama CLI
+  outputPanel.textContent = 'Generating JavaScript solution with Ollama (CLI)...';
   try {
-    const ollamaResp = await fetch('/ollama/solution', {
+    const response = await fetch('/ollama/solution', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -837,32 +1046,16 @@ async function fetchDeepSeekSolution(problem: Problem) {
       body: JSON.stringify(problem),
     });
 
-    const ollamaPayload = (await ollamaResp.json()) as { code?: string; error?: string };
-    if (ollamaResp.ok && ollamaPayload.code?.trim()) {
-      return ollamaPayload.code.trim();
+    const payload = (await response.json()) as { code?: string; error?: string };
+    if (!response.ok) {
+      throw new Error(payload.error ?? `Ollama CLI request failed with ${response.status}.`);
     }
 
-    console.warn('Ollama did not return code or failed:', ollamaPayload);
+    return payload.code?.trim() ?? null;
   } catch (err) {
-    console.warn('Ollama request error:', err instanceof Error ? err.message : String(err));
+    console.error('Ollama CLI fallback failed:', err);
+    return null;
   }
-
-  // Fallback to DeepSeek
-  outputPanel.textContent = 'Generating JavaScript solution with DeepSeek...';
-  const response = await fetch('/deepseek/solution', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(problem),
-  });
-
-  const payload = (await response.json()) as { code?: string; error?: string };
-  if (!response.ok) {
-    throw new Error(payload.error ?? `DeepSeek request failed with ${response.status}.`);
-  }
-
-  return payload.code?.trim() ?? null;
 }
 
 function extractPlaygroundIds(content: string) {
@@ -876,6 +1069,95 @@ function extractPlaygroundIds(content: string) {
   }
 
   return [...ids];
+}
+
+function extractAssistantJavaScript(content: string): string {
+  if (!content) return '';
+
+  // Prefer fenced JavaScript code blocks
+  const fenced = content.match(/```(?:javascript|js)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1] && fenced[1].trim()) {
+    return fenced[1].trim();
+  }
+
+  // Remove lines that are plain JSON objects (NDJSON from streaming) to reduce noise
+  const cleanedLines = content
+    .split(/\r?\n/)
+    .filter((l) => !/^\s*\{.*\}\s*$/.test(l))
+    .join('\n')
+    .trim();
+
+  // Try fenced block again on cleaned content
+  const fenced2 = cleanedLines.match(/```(?:javascript|js)?\s*([\s\S]*?)```/i);
+  if (fenced2 && fenced2[1] && fenced2[1].trim()) {
+    return fenced2[1].trim();
+  }
+
+  // If no fences, heuristically find code start (function, const, let, class)
+  const codeStartMatch = cleanedLines.match(/(^|\n)\s*(function|const|let|class)\s+/m);
+  if (codeStartMatch) {
+    const idx = cleanedLines.indexOf(codeStartMatch[0].trim());
+    return cleanedLines.slice(idx).trim();
+  }
+
+  // Fallback: return cleaned content but strip any leading assistant prose lines
+  // Remove any leading short prose sentences (heuristic)
+  const lines = cleanedLines.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*(function|const|let|class|\/\*|\/\/|\{)/.test(lines[i])) {
+      return lines.slice(i).join('\n').trim();
+    }
+  }
+
+  return cleanedLines;
+}
+
+function renderOutputWithImages(raw: string) {
+  // raw may contain description + assistant text. Render text and inline images below description.
+  outputPanel.innerHTML = '';
+  if (!raw) return;
+
+  // Extract markdown image syntax ![alt](url)
+  const mdImageRegex = /!\[[^\]]*\]\(([^)]+)\)/g;
+  // Extract data URL images
+  const dataImageRegex = /(data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+(?:\.[A-Za-z0-9+/=]+)*)/g;
+  // Extract plain image URLs ending with image extensions
+  const urlImageRegex = /(https?:\/\/[^\s"'<>)+]+\.(?:png|jpe?g|gif|svg)(?:\?[^\s"'<>]+)?)/gi;
+
+  // We'll process the string sequentially: find earliest match among regexes
+  let cursor = 0;
+  const combinedRegex = new RegExp(`${mdImageRegex.source}|${dataImageRegex.source}|${urlImageRegex.source}`, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = combinedRegex.exec(raw)) !== null) {
+    const idx = match.index;
+    if (idx > cursor) {
+      const textSegment = raw.slice(cursor, idx);
+      const p = document.createElement('pre');
+      p.textContent = textSegment.trim();
+      p.style.whiteSpace = 'pre-wrap';
+      outputPanel.appendChild(p);
+    }
+
+    const imageUrl = match[1] ?? match[2] ?? match[3];
+    if (imageUrl) {
+      const img = document.createElement('img');
+      img.src = imageUrl;
+      img.style.maxWidth = '100%';
+      img.style.marginTop = '8px';
+      img.alt = '';
+      outputPanel.appendChild(img);
+    }
+
+    cursor = combinedRegex.lastIndex;
+  }
+
+  if (cursor < raw.length) {
+    const rest = raw.slice(cursor);
+    const p = document.createElement('pre');
+    p.textContent = rest.trim();
+    p.style.whiteSpace = 'pre-wrap';
+    outputPanel.appendChild(p);
+  }
 }
 
 async function fetchPlaygroundJavaScript(uuid: string) {
@@ -1041,6 +1323,19 @@ function stripHtml(html: string) {
   return element.textContent?.replace(/\s+/g, ' ').trim() ?? '';
 }
 
+function formatProblemDescription(description: string) {
+  return String(description)
+    .replace(/\s+/g, ' ')
+    .replace(/\b(Example\s+\d+:)/g, '\n\n$1\n')
+    .replace(/\b(Constraints:)/g, '\n\n$1\n')
+    .replace(/\b(Input:)/g, '\n$1')
+    .replace(/\b(Output:)/g, '\n$1')
+    .replace(/\b(Explanation:)/g, '\n$1')
+    .replace(/([.!?])\s+(?=[A-Z])/g, '$1\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function resetBreakpoints() {
   breakpoints.clear();
   const loopLineIndex = editor
@@ -1089,6 +1384,7 @@ stopButton.addEventListener('click', () => {
   stopped = true;
   resumeMode = 'continue';
   clearActiveLine();
+  currentDebugVariables = null;
   resumeCurrentPause?.();
   setRunState('idle');
 });
@@ -1112,29 +1408,58 @@ async function runCode(initialMode: ResumeMode = 'continue') {
   outputPanel.textContent = 'Running...';
   lineText.textContent = '-';
   clearActiveLine();
+  currentDebugVariables = null;
   renderVariables(null);
 
   try {
-    const args = parseArguments(argsInput.value);
-    const instrumentedCode = instrumentCode(editor.getValue(), breakpoints);
-    const factory = new Function(
-      '__debug__',
-      `${instrumentedCode}
-return typeof solution === 'function' ? solution : null;`,
-    );
+    const parsed = parseArguments(argsInput.value);
+    let args: unknown[] = [];
+    let setupCode: string | null = null;
 
-    const solution = factory(handleProbe) as ((...args: unknown[]) => unknown) | null;
+    if (Array.isArray(parsed)) {
+      args = parsed;
+    } else if (parsed && typeof parsed === 'object' && (parsed as any).__setup) {
+      setupCode = (parsed as any).__setup as string;
+    }
+
+    const instrumentedCode = instrumentCode(editor.getValue(), breakpoints);
+
+    // If setup code is present, bind the solution to the constructed root (or first detected var)
+    let factory: Function;
+    if (setupCode) {
+      const match = setupCode.match(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+TreeNode/);
+      const varName = match?.[1] ?? (setupCode.includes('root') ? 'root' : 'root');
+
+      factory = new Function(
+        '__debug__',
+        'TreeNode',
+        `${instrumentedCode}\n${setupCode}\nreturn typeof solution === 'function' ? solution.bind(null, ${varName}) : null;`,
+      );
+    } else {
+      factory = new Function(
+        '__debug__',
+        'TreeNode',
+        `${instrumentedCode}\nreturn typeof solution === 'function' ? solution : null;`,
+      );
+    }
+
+    const solution = factory(handleProbe, TreeNode) as ((...args: unknown[]) => unknown) | null;
     if (!solution) {
       throw new Error('Define a function named solution.');
     }
 
-    const result = await solution(...args);
+    const invocations = buildSolutionInvocations(args, editor.getValue());
+    const results = [];
+    for (const invocationArgs of invocations) {
+      results.push(await solution(...invocationArgs));
+    }
+
     if (stopped) {
       outputPanel.textContent = 'Stopped.';
       return;
     }
 
-    outputPanel.textContent = stringifyValue(result);
+    outputPanel.textContent = stringifyValue(results.length === 1 ? results[0] : results);
     setRunState('done');
   } catch (error) {
     outputPanel.textContent = error instanceof Error ? error.message : String(error);
@@ -1147,13 +1472,134 @@ return typeof solution === 'function' ? solution : null;`,
   }
 }
 
-function parseArguments(input: string): unknown[] {
-  const parsed = JSON.parse(input);
-  if (!Array.isArray(parsed)) {
-    throw new Error('Arguments must be a JSON array, for example: [[2,7,11,15], 9]');
+function parseArguments(input: string): unknown[] | { __setup: string } {
+  try {
+    const parsed = JSON.parse(input);
+    if (!Array.isArray(parsed)) {
+      // Accept single value and wrap into array
+      return [parsed];
+    }
+
+    return parsed;
+  } catch (e) {
+    // Not JSON: treat as setup JavaScript code for constructing test state (e.g., TreeNode)
+    return { __setup: input };
+  }
+}
+
+function buildSolutionInvocations(args: unknown[], code: string): unknown[][] {
+  const paramNames = getSolutionParamNames(code);
+  const treeParamNames = getTreeParamNames(code);
+  const selectedProblem = getSelectedProblem();
+
+  if (paramNames.length === 1 && shouldConvertArgumentToTree(paramNames[0], args, selectedProblem, paramNames, treeParamNames)) {
+    return [[buildBinaryTreeFromLevelOrder(args)]];
   }
 
-  return parsed;
+  if (
+    paramNames.length === 1 &&
+    shouldConvertArgumentToTree(paramNames[0], args[0], selectedProblem, paramNames, treeParamNames) &&
+    args.every((arg) => Array.isArray(arg))
+  ) {
+    return args.map((arg) => [buildBinaryTreeFromLevelOrder(arg as unknown[])]);
+  }
+
+  return [args.map((arg, index) => {
+    return shouldConvertArgumentToTree(paramNames[index], arg, selectedProblem, paramNames, treeParamNames)
+      ? buildBinaryTreeFromLevelOrder(arg as unknown[])
+      : arg;
+  })];
+}
+
+function getSolutionParamNames(code: string) {
+  const match = stripJavaScriptComments(code).match(/function\s+solution\s*\(([^)]*)\)/);
+  if (!match || !match[1].trim()) {
+    return [];
+  }
+
+  return match[1]
+    .split(',')
+    .map((param) => param.trim())
+    .filter(Boolean);
+}
+
+function stripJavaScriptComments(code: string) {
+  return code
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+}
+
+function getTreeParamNames(code: string) {
+  const names = new Set<string>();
+  const treeParamPattern = /@param\s*\{[^}]*TreeNode[^}]*}\s+([A-Za-z_$][\w$]*)/g;
+  for (const match of code.matchAll(treeParamPattern)) {
+    names.add(match[1]);
+  }
+
+  return names;
+}
+
+function getSelectedProblem() {
+  return problems.find((problem) => problem.id === selectedProblemId) ?? null;
+}
+
+function shouldConvertArgumentToTree(
+  paramName: string | undefined,
+  value: unknown,
+  problem: Problem | null,
+  paramNames: string[],
+  treeParamNames: Set<string>,
+) {
+  if (!Array.isArray(value) || !isLevelOrderTreeInput(value)) {
+    return false;
+  }
+
+  if (paramName && treeParamNames.has(paramName)) {
+    return true;
+  }
+
+  const normalizedParamName = normalizeSearchText(paramName ?? '');
+  if (normalizedParamName === 'root' || normalizedParamName.endsWith('root')) {
+    return true;
+  }
+
+  const problemText = normalizeSearchText(`${problem?.title ?? ''} ${problem?.titleSlug ?? ''} ${(problem?.tags ?? []).join(' ')}`);
+  return paramNames.length === 1 && /\b(binary tree|tree)\b/.test(problemText);
+}
+
+function isLevelOrderTreeInput(value: unknown[]) {
+  return value.every((item) => item === null || ['number', 'string', 'boolean'].includes(typeof item));
+}
+
+function buildBinaryTreeFromLevelOrder(values: unknown[]) {
+  if (values.length === 0 || values[0] == null) {
+    return null;
+  }
+
+  const root = new TreeNode(values[0]);
+  const queue: TreeNode[] = [root];
+  let valueIndex = 1;
+
+  while (queue.length > 0 && valueIndex < values.length) {
+    const node = queue.shift()!;
+    const leftValue = values[valueIndex++];
+    if (leftValue != null) {
+      node.left = new TreeNode(leftValue);
+      queue.push(node.left);
+    }
+
+    if (valueIndex >= values.length) {
+      break;
+    }
+
+    const rightValue = values[valueIndex++];
+    if (rightValue != null) {
+      node.right = new TreeNode(rightValue);
+      queue.push(node.right);
+    }
+  }
+
+  return root;
 }
 
 async function handleBreakpoint(snapshot: DebugSnapshot) {
@@ -1175,6 +1621,7 @@ async function handleProbe(snapshot: DebugSnapshot) {
   setActiveLine(snapshot.line);
   editor.revealLineInCenter(snapshot.line);
   editor.setPosition({ lineNumber: snapshot.line, column: 1 });
+  currentDebugVariables = snapshot.variables;
   renderVariables(snapshot.variables);
 
   await new Promise<void>((resolve) => {
@@ -1186,6 +1633,7 @@ async function handleProbe(snapshot: DebugSnapshot) {
 
   if (!stopped) {
     clearActiveLine();
+    currentDebugVariables = null;
     setRunState('running');
   }
 }
@@ -1211,24 +1659,34 @@ function clearActiveLine() {
 function instrumentCode(source: string, activeBreakpoints: Set<number>) {
   const lines = source.split('\n');
   const namesByLine = collectVisibleNames(lines);
-  let functionDepth = 0;
+  const localFunctionNames = collectLocalFunctionNames(lines);
+  let solutionDepth = 0;
   let expressionDepth = 0;
 
   return lines
     .map((line, index) => {
       const lineNumber = index + 1;
       const trimmed = line.trim();
+      const isSolutionDeclaration = /^function\s+solution\s*\(/.test(trimmed);
+      const isNestedFunctionDeclaration = solutionDepth > 0 && /\bfunction\s+[A-Za-z_$][\w$]*\s*\(/.test(trimmed);
 
       let nextLine = line;
-      if (/^function\s+solution\s*\(/.test(trimmed)) {
+      if (isSolutionDeclaration) {
         nextLine = line.replace(/function\s+solution\s*\(/, 'async function solution(');
+      } else if (isNestedFunctionDeclaration) {
+        nextLine = line.replace(/\bfunction\s+/, 'async function ');
+      } else if (solutionDepth > 0) {
+        nextLine = awaitLocalFunctionCalls(line, localFunctionNames);
       }
 
-      const shouldProbe = functionDepth > 0 && expressionDepth === 0 && isRunnableLine(trimmed);
+      const shouldProbe = solutionDepth > 0 && expressionDepth === 0 && isRunnableLine(trimmed);
       const openBraces = (line.match(/{/g) ?? []).length;
       const closeBraces = (line.match(/}/g) ?? []).length;
       expressionDepth = Math.max(0, expressionDepth + countExpressionDepthDelta(line));
-      functionDepth = Math.max(0, functionDepth + openBraces - closeBraces);
+
+      if (solutionDepth > 0 || isSolutionDeclaration) {
+        solutionDepth = Math.max(0, solutionDepth + openBraces - closeBraces);
+      }
 
       if (!shouldProbe) {
         return nextLine;
@@ -1240,6 +1698,42 @@ function instrumentCode(source: string, activeBreakpoints: Set<number>) {
       return `${indent}await __debug__({ line: ${lineNumber}, isBreakpoint: ${isBreakpoint}, variables: ${capture} });\n${nextLine}`;
     })
     .join('\n');
+}
+
+function collectLocalFunctionNames(lines: string[]) {
+  const names = new Set<string>();
+  let solutionDepth = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const isSolutionDeclaration = /^function\s+solution\s*\(/.test(trimmed);
+    const functionMatch = trimmed.match(/^function\s+([A-Za-z_$][\w$]*)\s*\(/);
+    if (solutionDepth > 0 && functionMatch && functionMatch[1] !== 'solution') {
+      names.add(functionMatch[1]);
+    }
+
+    const openBraces = (line.match(/{/g) ?? []).length;
+    const closeBraces = (line.match(/}/g) ?? []).length;
+    if (solutionDepth > 0 || isSolutionDeclaration) {
+      solutionDepth = Math.max(0, solutionDepth + openBraces - closeBraces);
+    }
+  }
+
+  return names;
+}
+
+function awaitLocalFunctionCalls(line: string, functionNames: Set<string>) {
+  if (functionNames.size === 0 || /\bawait\b/.test(line)) {
+    return line;
+  }
+
+  let nextLine = line;
+  for (const name of functionNames) {
+    const callPattern = new RegExp(`(?<![\\w$.])${name}\\s*\\(`, 'g');
+    nextLine = nextLine.replace(callPattern, `await ${name}(`);
+  }
+
+  return nextLine;
 }
 
 function countExpressionDepthDelta(line: string) {
@@ -1316,21 +1810,26 @@ function renderVariables(variables: Record<string, unknown> | null) {
 
   variablesPanel.className = 'variables';
   const indexByName = getVisibleIndexes(variables);
+  const highlightedTreeNodes = getHighlightedTreeNodes(variables);
+  const treeMonitor = renderTreeMonitor(variables, highlightedTreeNodes);
+  const rows = Object.entries(variables).map(([name, value]) => {
+    const row = document.createElement('div');
+    row.className = 'variable-row';
+
+    const label = document.createElement('span');
+    label.className = 'variable-name';
+    label.textContent = name;
+
+    const code = document.createElement('code');
+    code.append(renderVariableValue(value, indexByName, highlightedTreeNodes));
+
+    row.append(label, code);
+    return row;
+  });
+
   variablesPanel.replaceChildren(
-    ...Object.entries(variables).map(([name, value]) => {
-      const row = document.createElement('div');
-      row.className = 'variable-row';
-
-      const label = document.createElement('span');
-      label.className = 'variable-name';
-      label.textContent = name;
-
-      const code = document.createElement('code');
-      code.append(renderVariableValue(value, indexByName));
-
-      row.append(label, code);
-      return row;
-    }),
+    ...(treeMonitor ? [treeMonitor] : []),
+    ...rows,
   );
 }
 
@@ -1346,22 +1845,110 @@ function getVisibleIndexes(variables: Record<string, unknown>) {
   return result;
 }
 
-function renderVariableValue(value: unknown, indexes: Map<string, number>) {
-  if (!Array.isArray(value) || indexes.size === 0) {
+function getHighlightedTreeNodes(variables: Record<string, unknown>) {
+  const highlighted = new Set<TreeNode>();
+  for (const [name, value] of Object.entries(variables)) {
+    if (!isTreeNode(value)) {
+      continue;
+    }
+
+    const normalizedName = normalizeSearchText(name);
+    if (['node', 'current', 'cur', 'curr', 'iterator', 'iter'].includes(normalizedName)) {
+      highlighted.add(value);
+    }
+  }
+
+  return highlighted;
+}
+
+function renderTreeMonitor(variables: Record<string, unknown>, highlightedTreeNodes: Set<TreeNode>) {
+  const root = findRootTreeNode(variables);
+  if (!root) {
+    return null;
+  }
+
+  const monitor = document.createElement('section');
+  monitor.className = 'tree-monitor';
+
+  const header = document.createElement('div');
+  header.className = 'tree-monitor-header';
+  header.textContent = 'Tree';
+
+  const diagram = renderTreeDiagram(root, highlightedTreeNodes);
+  monitor.append(header, diagram);
+  return monitor;
+}
+
+function findRootTreeNode(variables: Record<string, unknown>) {
+  if (isTreeNode(variables.root)) {
+    return variables.root;
+  }
+
+  const treeEntry = Object.entries(variables).find(([name, value]) => {
+    const normalizedName = normalizeSearchText(name);
+    return isTreeNode(value) && (normalizedName.endsWith('root') || normalizedName.includes('tree'));
+  });
+
+  return isTreeNode(treeEntry?.[1]) ? treeEntry[1] : null;
+}
+
+function renderVariableValue(value: unknown, indexes: Map<string, number>, highlightedTreeNodes: Set<TreeNode>) {
+  if (isTreeNode(value)) {
+    return renderTreeDiagram(value, highlightedTreeNodes);
+  }
+
+  if (!Array.isArray(value)) {
     return document.createTextNode(stringifyValue(value));
   }
 
+  // Detect 2D array (array of arrays)
+  const is2D = value.length > 0 && value.every((row) => Array.isArray(row));
+  if (is2D) {
+    const table = document.createElement('table');
+    table.className = 'array-table';
+
+    // Determine max columns
+    const rows = (value as unknown[][]).map((r) => Array.isArray(r) ? r : [r]);
+    const cols = Math.max(0, ...rows.map((r) => r.length));
+
+    // Build table body
+    const tbody = document.createElement('tbody');
+    rows.forEach((r, rowIndex) => {
+      const tr = document.createElement('tr');
+      for (let c = 0; c < cols; c++) {
+        const td = document.createElement('td');
+        const cellVal = c < r.length ? r[c] : undefined;
+        td.append(renderVariableValue(cellVal, indexes, highlightedTreeNodes));
+
+        // Highlight cell if indexes contain i and j matching
+        const i = indexes.get('i') ?? indexes.get('row') ?? indexes.get('r');
+        const j = indexes.get('j') ?? indexes.get('col') ?? indexes.get('c') ?? indexes.get('k');
+        if (i === rowIndex && j === c) {
+          td.className = 'current-array-element';
+          td.title = `Current index: ${[...indexes.entries()].filter(([, v]) => v === rowIndex || v === c).map(([n]) => n).join(', ')}`;
+        }
+
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    });
+
+    table.appendChild(tbody);
+    return table;
+  }
+
+  // Fallback: 1D array rendering with highlights
   const wrapper = document.createElement('span');
   wrapper.className = 'array-preview';
   wrapper.append('[');
 
-  value.forEach((item, itemIndex) => {
+  (value as unknown[]).forEach((item, itemIndex) => {
     if (itemIndex > 0) {
       wrapper.append(', ');
     }
 
     const element = document.createElement('span');
-    element.textContent = stringifyValue(item);
+    element.append(renderVariableValue(item, indexes, highlightedTreeNodes));
 
     const matchingIndexes = [...indexes.entries()].filter(([, indexValue]) => indexValue === itemIndex);
     if (matchingIndexes.length > 0) {
@@ -1374,6 +1961,66 @@ function renderVariableValue(value: unknown, indexes: Map<string, number>) {
 
   wrapper.append(']');
   return wrapper;
+}
+
+function isTreeNode(value: unknown): value is TreeNode {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'val' in value &&
+    'left' in value &&
+    'right' in value
+  );
+}
+
+function renderTreeDiagram(root: TreeNode, highlightedTreeNodes: Set<TreeNode>) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'tree-diagram';
+  wrapper.append(renderTreeNode(root, highlightedTreeNodes, 0));
+  return wrapper;
+}
+
+function renderTreeNode(node: TreeNode | null, highlightedTreeNodes: Set<TreeNode>, depth: number): HTMLElement {
+  const item = document.createElement('div');
+  item.className = 'tree-node-group';
+
+  const badge = document.createElement('span');
+  badge.className = node && highlightedTreeNodes.has(node) ? 'tree-node current-tree-node' : 'tree-node';
+  badge.textContent = node ? stringifyValue(node.val) : 'null';
+  item.append(badge);
+
+  if (!node || depth >= 7 || (!node.left && !node.right)) {
+    return item;
+  }
+
+  const children = document.createElement('div');
+  children.className = 'tree-children';
+  children.append(renderTreeNode(node.left, highlightedTreeNodes, depth + 1));
+  children.append(renderTreeNode(node.right, highlightedTreeNodes, depth + 1));
+  item.append(children);
+
+  return item;
+}
+
+function formatHoverValue(value: unknown) {
+  if (isTreeNode(value)) {
+    return JSON.stringify(treeNodePreview(value), null, 2);
+  }
+
+  const text = stringifyValue(value);
+  return text.length > 1800 ? `${text.slice(0, 1800)}\n...` : text;
+}
+
+function treeNodePreview(node: TreeNode | null): unknown {
+  if (!node) {
+    return null;
+  }
+
+  return {
+    val: node.val,
+    left: node.left ? node.left.val : null,
+    right: node.right ? node.right.val : null,
+  };
 }
 
 function stringifyValue(value: unknown) {

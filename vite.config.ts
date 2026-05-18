@@ -3,6 +3,16 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   plugins: [ollamaSolutionPlugin()],
   server: {
+    // Note: binding to port 80 may require elevated privileges on Unix-like systems.
+    port: 8080,
+    host: true,
+    hmr: {
+      protocol: 'wss',
+      host: 'bruceleecode.org',
+      clientPort: 443,
+    },
+    // Allow the bruceleecode.org host for incoming requests (adjust as needed).
+    allowedHosts: ['bruceleecode.org', 'localhost', '127.0.0.1'],
     proxy: {
       '/leetcode/graphql': {
         target: 'https://leetcode.com',
@@ -17,6 +27,17 @@ export default defineConfig({
         target: 'https://alfa-leetcode-api.onrender.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/alfa/, ''),
+      },
+      // Proxy Ollama HTTP API to avoid CORS/preflight issues from the browser
+      '/api/chat': {
+        target: 'http://localhost:11434',
+        changeOrigin: true,
+        secure: false,
+      },
+      '/api/generate': {
+        target: 'http://localhost:11434',
+        changeOrigin: true,
+        secure: false,
       },
     },
   },
@@ -34,25 +55,31 @@ function ollamaSolutionPlugin() {
           return;
         }
 
-        // Use env model or default to 'llama' if not set.
-        const model = process.env.OLLAMA_MODEL ?? 'llama';
+        // Use env model or default to a known local model if not set.
+        const model = process.env.OLLAMA_MODEL ?? 'llama3.2:latest';
 
         try {
           const body = await readJsonBody(request);
           const prompt = buildDeepSeekPrompt(body);
-          const { execFile } = require('child_process');
+          const { execFile } = await import('child_process');
 
-          execFile('ollama', ['generate', model, '--prompt', prompt], { maxBuffer: 10 * 1024 * 1024 }, (err:any, stdout:any, stderr:any) => {
+          // Run ollama and return plain stdout. Use --nowordwrap to avoid inserted line breaks.
+          console.log('[ollama] /ollama/solution request, model=', model);
+          execFile('ollama', ['run', model, prompt, '--nowordwrap'], { maxBuffer: 10 * 1024 * 1024, timeout: 120000 }, (err:any, stdout:any, stderr:any) => {
+            console.log('[ollama] stdout length=', stdout ? String(stdout).length : 0);
+            if (stderr) console.error('[ollama] stderr', String(stderr).slice(0, 1000));
             if (err) {
+              console.error('[ollama] error', err);
               response.statusCode = 500;
               response.setHeader('Content-Type', 'application/json');
-              response.end(JSON.stringify({ error: err.message + (stderr ? ': ' + String(stderr) : '') }));
+              const timedOut = (err as any).killed && (err as any).signal === 'SIGTERM';
+              response.end(JSON.stringify({ error: err.message + (stderr ? ': ' + String(stderr) : ''), timedOut }));
               return;
             }
 
             const content = String(stdout ?? '').trim();
             response.setHeader('Content-Type', 'application/json');
-            response.end(JSON.stringify({ code: stripMarkdownCodeFence(content) }));
+            response.end(JSON.stringify({ code: stripMarkdownCodeFence(content), raw: content }));
           });
         } catch (error) {
           response.statusCode = 500;
@@ -105,4 +132,3 @@ function stripMarkdownCodeFence(content: string): string {
     .replace(/```$/i, '')
     .trim();
 }
-
