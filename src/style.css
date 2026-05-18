@@ -264,7 +264,8 @@ textarea {
 }
 
 .variables,
-.output {
+.output,
+.result-output {
   min-height: 140px;
   margin: 0;
   border: 1px solid #d5dde7;
@@ -306,7 +307,8 @@ textarea {
 }
 
 .variable-row code,
-.output {
+.output,
+.result-output {
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   line-height: 1.5;
@@ -445,10 +447,15 @@ textarea {
   }
 }
 
-.output {
+.output,
+.result-output {
   padding: 12px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.result-output {
+  min-height: 72px;
 }
 
 .breakpoint-glyph {

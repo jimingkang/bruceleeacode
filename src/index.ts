@@ -362,6 +362,11 @@ app.innerHTML = `
         <h2>Output</h2>
         <div id="outputPanel" class="output">No output yet.</div>
       </section>
+
+      <section class="panel-block">
+        <h2>Result</h2>
+        <div id="resultPanel" class="result-output">No result yet.</div>
+      </section>
     </aside>
 
     <section class="workspace">
@@ -422,6 +427,7 @@ const stateText = requiredElement<HTMLElement>('#stateText');
 const lineText = requiredElement<HTMLElement>('#lineText');
 const variablesPanel = requiredElement<HTMLDivElement>('#variablesPanel');
 const outputPanel = requiredElement<HTMLDivElement>('#outputPanel');
+const resultPanel = requiredElement<HTMLDivElement>('#resultPanel');
 
 argsInput.value = defaultArgs;
 let selectedProblemId = problems[0].id;
@@ -718,7 +724,7 @@ function createProblemButton(problem: Problem, className = 'problem-item') {
   button.className = problem.id === selectedProblemId ? `${className} selected` : className;
   button.addEventListener('click', () => {
     void loadProblem(problem).catch((error) => {
-      outputPanel.textContent = error instanceof Error ? error.message : String(error);
+      resultPanel.textContent = error instanceof Error ? error.message : String(error);
       setRunState('error');
     });
   });
@@ -744,6 +750,7 @@ async function loadProblem(problem: Problem) {
   clearActiveLine();
   setRunState('idle');
   lineText.textContent = '-';
+  resultPanel.textContent = 'No result yet.';
   outputPanel.textContent = problem.titleSlug ? 'Loading official solution from alfa-leetcode-api...' : 'No output yet.';
   renderVariables(null);
 
@@ -1405,7 +1412,7 @@ async function runCode(initialMode: ResumeMode = 'continue') {
   stopped = false;
   resumeMode = initialMode;
   setRunState('running');
-  outputPanel.textContent = 'Running...';
+  resultPanel.textContent = 'Running...';
   lineText.textContent = '-';
   clearActiveLine();
   currentDebugVariables = null;
@@ -1455,14 +1462,17 @@ async function runCode(initialMode: ResumeMode = 'continue') {
     }
 
     if (stopped) {
-      outputPanel.textContent = 'Stopped.';
+      resultPanel.textContent = 'Stopped.';
       return;
     }
 
-    outputPanel.textContent = stringifyValue(results.length === 1 ? results[0] : results);
+    resultPanel.textContent = stringifyValue(results.length === 1 ? results[0] : results);
+    clearActiveLine();
+    currentDebugVariables = null;
+    lineText.textContent = '-';
     setRunState('done');
   } catch (error) {
-    outputPanel.textContent = error instanceof Error ? error.message : String(error);
+    resultPanel.textContent = error instanceof Error ? error.message : String(error);
     setRunState('error');
   } finally {
     resumeCurrentPause = null;
@@ -1901,8 +1911,8 @@ function renderVariableValue(value: unknown, indexes: Map<string, number>, highl
     return document.createTextNode(stringifyValue(value));
   }
 
-  // Detect 2D array (array of arrays)
-  const is2D = value.length > 0 && value.every((row) => Array.isArray(row));
+  // Detect rectangular primitive matrices. Jagged nested arrays are usually adjacency lists.
+  const is2D = isRectangularPrimitiveMatrix(value);
   if (is2D) {
     const table = document.createElement('table');
     table.className = 'array-table';
@@ -1961,6 +1971,22 @@ function renderVariableValue(value: unknown, indexes: Map<string, number>, highl
 
   wrapper.append(']');
   return wrapper;
+}
+
+function isRectangularPrimitiveMatrix(value: unknown[]) {
+  if (value.length === 0 || !value.every((row) => Array.isArray(row))) {
+    return false;
+  }
+
+  const rows = value as unknown[][];
+  const width = rows[0].length;
+  return rows.every((row) => {
+    return row.length === width && row.every((item) => !Array.isArray(item) && !isPlainObject(item));
+  });
+}
+
+function isPlainObject(value: unknown) {
+  return value !== null && typeof value === 'object' && !(value instanceof Map) && !(value instanceof Set);
 }
 
 function isTreeNode(value: unknown): value is TreeNode {
@@ -2025,15 +2051,19 @@ function treeNodePreview(node: TreeNode | null): unknown {
 
 function stringifyValue(value: unknown) {
   if (value instanceof Map) {
-    return JSON.stringify(Object.fromEntries(value), null, 2);
+    return JSON.stringify(Object.fromEntries(value), jsonValueReplacer, 2);
   }
 
   if (value instanceof Set) {
-    return JSON.stringify([...value], null, 2);
+    return JSON.stringify([...value], jsonValueReplacer, 2);
   }
 
   if (typeof value === 'undefined') {
     return 'undefined';
+  }
+
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return String(value);
   }
 
   if (typeof value === 'function') {
@@ -2041,10 +2071,22 @@ function stringifyValue(value: unknown) {
   }
 
   try {
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(value, jsonValueReplacer, 2);
   } catch {
     return String(value);
   }
+}
+
+function jsonValueReplacer(_key: string, value: unknown) {
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    return String(value);
+  }
+
+  if (typeof value === 'undefined') {
+    return 'undefined';
+  }
+
+  return value;
 }
 
 function setRunState(state: RunState) {
