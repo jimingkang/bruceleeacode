@@ -1,0 +1,4 @@
+# Manim's pinned PyAV dependency can require a compatibility workaround on
+# Python 3.14. Use scripts/setup-python-env.sh for this project.
+Pillow>=9.1
+manim==0.19.0

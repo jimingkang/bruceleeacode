@@ -1,3 +1,6 @@
+import { createReadStream } from 'node:fs';
+import { readdir, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
@@ -47,6 +50,148 @@ function ollamaSolutionPlugin() {
   return {
     name: 'ollama-solution-api',
     configureServer(server:any) {
+      server.middlewares.use('/algorithm-media', async (request: any, response: any) => {
+        const url = new URL(request.url ?? '/', 'http://localhost');
+        const relativePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
+        const mediaRoot = path.resolve(process.cwd(), 'media');
+        const requestedPath = path.resolve(mediaRoot, relativePath);
+
+        if (!requestedPath.startsWith(mediaRoot)) {
+          response.statusCode = 403;
+          response.end('Forbidden');
+          return;
+        }
+
+        try {
+          response.setHeader('Content-Type', getMediaContentType(requestedPath));
+          createReadStream(requestedPath).pipe(response);
+        } catch {
+          response.statusCode = 404;
+          response.end('Not found');
+        }
+      });
+
+      server.middlewares.use('/algorithm/interactive', async (request: any, response: any) => {
+        if (request.method !== 'GET') {
+          response.statusCode = 405;
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ error: 'Method not allowed.' }));
+          return;
+        }
+
+        try {
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const problemId = String(url.searchParams.get('problemId') ?? '').trim();
+          if (!/^\d+$/.test(problemId)) {
+            throw new Error('problemId must be a LeetCode number.');
+          }
+
+          const interactiveRoot = path.resolve(process.cwd(), 'media', 'interactive');
+          const entries = await readdir(interactiveRoot, { withFileTypes: true }).catch(() => []);
+          const match = entries
+            .filter((entry) => entry.isFile() && entry.name.startsWith(`${problemId}_`) && entry.name.endsWith('.html'))
+            .map((entry) => entry.name)
+            .sort((left, right) => left.localeCompare(right))[0];
+
+          if (!match) {
+            response.statusCode = 404;
+            response.setHeader('Content-Type', 'application/json');
+            response.end(JSON.stringify({
+              error: `No interactive animation found. Expected a file named like media/interactive/${problemId}_*.html.`,
+            }));
+            return;
+          }
+
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ htmlPath: `/algorithm-media/interactive/${encodeURIComponent(match)}` }));
+        } catch (error) {
+          response.statusCode = 500;
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+        }
+      });
+
+      server.middlewares.use('/algorithm/gif', async (request: any, response: any) => {
+        if (request.method !== 'POST') {
+          response.statusCode = 405;
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ error: 'Method not allowed.' }));
+          return;
+        }
+
+        try {
+          const body = await readJsonBody(request);
+          const arrayData = body.arrayData;
+          const className = String(body.className ?? 'ArrayVisualization');
+
+          if (!Array.isArray(arrayData)) {
+            throw new Error('arrayData must be an array.');
+          }
+
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(className)) {
+            throw new Error('className must be a valid Python class name.');
+          }
+
+          const { execFile } = await import('child_process');
+          const manimExecutable = path.resolve(process.cwd(), '.venv/bin/manim');
+          const scriptPath = path.resolve(process.cwd(), 'my_algorithm_scene.py');
+          const beforeStartedAt = Date.now();
+
+          execFile(
+            manimExecutable,
+            ['-ql', '--format=gif', scriptPath, className],
+            {
+              cwd: process.cwd(),
+              env: {
+                ...process.env,
+                ALGORITHM_VISUALIZATION_DATA: JSON.stringify(arrayData),
+              },
+              maxBuffer: 20 * 1024 * 1024,
+              timeout: 180000,
+            },
+            async (err: any, stdout: any, stderr: any) => {
+              if (err) {
+                renderGifWithPillowFallback(className, arrayData, beforeStartedAt, String(stderr ?? err.message))
+                  .then((payload) => {
+                    response.setHeader('Content-Type', 'application/json');
+                    response.end(JSON.stringify(payload));
+                  })
+                  .catch((fallbackError) => {
+                    response.statusCode = 500;
+                    response.setHeader('Content-Type', 'application/json');
+                    response.end(JSON.stringify({
+                      error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+                      manimError: err.message,
+                      stderr: String(stderr ?? '').slice(0, 4000),
+                      stdout: String(stdout ?? '').slice(0, 4000),
+                    }));
+                  });
+                return;
+              }
+
+              const gifPath = await findLatestFile(path.resolve(process.cwd(), 'media'), '.gif', beforeStartedAt).catch(() => null);
+              if (!gifPath) {
+                response.statusCode = 500;
+                response.setHeader('Content-Type', 'application/json');
+                response.end(JSON.stringify({ error: 'Manim finished but no GIF was found under media/.' }));
+                return;
+              }
+
+              const mediaRelativePath = path.relative(path.resolve(process.cwd(), 'media'), gifPath).split(path.sep).join('/');
+              response.setHeader('Content-Type', 'application/json');
+              response.end(JSON.stringify({
+                gifPath: `/algorithm-media/${mediaRelativePath}`,
+                stdout: String(stdout ?? ''),
+              }));
+            },
+          );
+        } catch (error) {
+          response.statusCode = 500;
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+        }
+      });
+
       server.middlewares.use('/ollama/solution', async (request :any, response:any) => {
         if (request.method !== 'POST') {
           response.statusCode = 405;
@@ -89,6 +234,101 @@ function ollamaSolutionPlugin() {
       });
     },
   };
+}
+
+async function renderGifWithPillowFallback(className: string, arrayData: unknown[], beforeStartedAt: number, manimError: string) {
+  const { execFile } = await import('child_process');
+  const pythonExecutable = path.resolve(process.cwd(), '.venv/bin/python');
+  const scriptPath = path.resolve(process.cwd(), 'scripts/render_algorithm_gif.py');
+
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      pythonExecutable,
+      [scriptPath, className],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          ALGORITHM_VISUALIZATION_DATA: JSON.stringify(arrayData),
+        },
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 60000,
+      },
+      (error: any, stdout: any, stderr: any) => {
+        if (error) {
+          reject(new Error(`${error.message}\n${String(stderr ?? stdout ?? '').slice(0, 4000)}`));
+          return;
+        }
+
+        resolve();
+      },
+    );
+  });
+
+  const gifPath = await findLatestFile(path.resolve(process.cwd(), 'media'), '.gif', beforeStartedAt);
+  if (!gifPath) {
+    throw new Error('Fallback renderer finished but no GIF was found under media/.');
+  }
+
+  const mediaRelativePath = path.relative(path.resolve(process.cwd(), 'media'), gifPath).split(path.sep).join('/');
+  return {
+    gifPath: `/algorithm-media/${mediaRelativePath}`,
+    warning: `Manim failed, generated GIF with Python fallback renderer instead: ${manimError.slice(0, 800)}`,
+  };
+}
+
+function getMediaContentType(filePath: string) {
+  if (filePath.endsWith('.gif')) {
+    return 'image/gif';
+  }
+
+  if (filePath.endsWith('.html')) {
+    return 'text/html; charset=utf-8';
+  }
+
+  if (filePath.endsWith('.css')) {
+    return 'text/css; charset=utf-8';
+  }
+
+  if (filePath.endsWith('.js')) {
+    return 'text/javascript; charset=utf-8';
+  }
+
+  return 'application/octet-stream';
+}
+
+async function findLatestFile(root: string, extension: string, minimumMtimeMs: number): Promise<string | null> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  let latest: { path: string; mtimeMs: number } | null = null;
+
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await findLatestFile(entryPath, extension, minimumMtimeMs);
+      if (nested) {
+        const nestedStat = await stat(nested);
+        if (!latest || nestedStat.mtimeMs > latest.mtimeMs) {
+          latest = { path: nested, mtimeMs: nestedStat.mtimeMs };
+        }
+      }
+      continue;
+    }
+
+    if (!entry.isFile() || !entry.name.endsWith(extension)) {
+      continue;
+    }
+
+    const entryStat = await stat(entryPath);
+    if (entryStat.mtimeMs < minimumMtimeMs - 1000) {
+      continue;
+    }
+
+    if (!latest || entryStat.mtimeMs > latest.mtimeMs) {
+      latest = { path: entryPath, mtimeMs: entryStat.mtimeMs };
+    }
+  }
+
+  return latest?.path ?? null;
 }
 
 function readJsonBody(request: any): Promise<any> {

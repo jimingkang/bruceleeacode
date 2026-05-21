@@ -2,6 +2,7 @@ import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
 import * as monaco from 'monaco-editor';
 import './style.css';
+import { leetcodeOneToHundredProblems, type LeetCodeProblemSeed } from './leetcodeOneToHundred';
 
 (self as unknown as { MonacoEnvironment: { getWorker: (_workerId: string, label: string) => Worker } }).MonacoEnvironment = {
   getWorker: (_workerId: string, label: string) => {
@@ -82,6 +83,19 @@ type PlaygroundCodeResponse = {
   } | null;
 };
 
+type AlgorithmGifResponse = {
+  gifPath?: string;
+  error?: string;
+  stderr?: string;
+  stdout?: string;
+  warning?: string;
+};
+
+type AlgorithmInteractiveResponse = {
+  htmlPath?: string;
+  error?: string;
+};
+
 type CategoryNode = {
   title: string;
   query: string;
@@ -103,7 +117,17 @@ class TreeNode {
   }
 }
 
-const defaultProblems: Problem[] = [
+class ListNode {
+  val: unknown;
+  next: ListNode | null;
+
+  constructor(val: unknown = 0, next: ListNode | null = null) {
+    this.val = val;
+    this.next = next;
+  }
+}
+
+const localSolutionProblems: Problem[] = [
   {
     id: 1,
     title: 'Two Sum',
@@ -230,12 +254,36 @@ const defaultProblems: Problem[] = [
   },
 ];
 
+function buildDefaultProblems(localProblems: Problem[], seedProblems: LeetCodeProblemSeed[]): Problem[] {
+  const byId = new Map<number, Problem>();
+
+  for (const seed of seedProblems) {
+    byId.set(seed.id, {
+      ...seed,
+      code: '',
+      source: 'local',
+    });
+  }
+
+  for (const problem of localProblems) {
+    byId.set(problem.id, {
+      ...byId.get(problem.id),
+      ...problem,
+      source: problem.source ?? 'local',
+    });
+  }
+
+  return [...byId.values()].sort((left, right) => left.id - right.id);
+}
+
+const defaultProblems: Problem[] = buildDefaultProblems(localSolutionProblems, leetcodeOneToHundredProblems);
 let problems: Problem[] = [...defaultProblems];
 // Store raw assistant text responses per problem so the output panel can show the assistant text
 const assistantTextByProblem = new Map<string, string>();
 const starterCode = problems[0].code;
 const defaultArgs = problems[0].args;
 let searchRequestId = 0;
+let debugExplanationRequestId = 0;
 
 const searchAliases: Record<string, string[]> = {
   'two point': ['two pointers', 'two pointer'],
@@ -371,19 +419,33 @@ app.innerHTML = `
 
     <section class="workspace">
       <header class="topbar">
-        <div>
-          <h1>LeetCode JS Debugger</h1>
-          <p>Click the Monaco gutter to set breakpoints, then run or step through the function.</p>
-        </div>
         <div class="run-controls">
           <button id="runButton" type="button">Run</button>
+          <button id="visualizeButton" type="button">Animation</button>
           <button id="resumeButton" type="button" disabled>Resume</button>
           <button id="stepOverButton" type="button" disabled>Step Over</button>
           <button id="stepInButton" type="button" disabled>Step In</button>
           <button id="stopButton" type="button" disabled>Stop</button>
         </div>
       </header>
-      <div id="editor" class="editor" aria-label="JavaScript editor"></div>
+      <div class="workspace-content">
+        <section id="animationPanel" class="animation-panel hidden" aria-label="Algorithm animation">
+          <div class="animation-panel-header">
+            <span id="animationTitle">Animation</span>
+            <button id="animationCloseButton" type="button" aria-label="Hide animation">Hide</button>
+          </div>
+          <iframe id="animationFrame" title="Algorithm animation"></iframe>
+        </section>
+        <div id="editor" class="editor" aria-label="JavaScript editor"></div>
+        <section id="streamPanel" class="stream-panel hidden" aria-label="Assistant streaming output">
+          <div class="stream-panel-title">Streaming</div>
+          <pre id="streamContent"></pre>
+        </section>
+        <section class="ai-chat-panel" aria-label="Talk to Ollama">
+          <textarea id="aiChatInput" rows="3" spellcheck="false" placeholder="Ask Ollama about this solution..."></textarea>
+          <button id="aiChatSendButton" type="button">Send</button>
+        </section>
+      </div>
     </section>
 
     <aside class="side-panel">
@@ -419,6 +481,7 @@ const problemSearchButton = requiredElement<HTMLButtonElement>('#problemSearchBu
 const problemList = requiredElement<HTMLDivElement>('#problemList');
 const argsInput = requiredElement<HTMLTextAreaElement>('#argsInput');
 const runButton = requiredElement<HTMLButtonElement>('#runButton');
+const visualizeButton = requiredElement<HTMLButtonElement>('#visualizeButton');
 const resumeButton = requiredElement<HTMLButtonElement>('#resumeButton');
 const stepOverButton = requiredElement<HTMLButtonElement>('#stepOverButton');
 const stepInButton = requiredElement<HTMLButtonElement>('#stepInButton');
@@ -428,6 +491,14 @@ const lineText = requiredElement<HTMLElement>('#lineText');
 const variablesPanel = requiredElement<HTMLDivElement>('#variablesPanel');
 const outputPanel = requiredElement<HTMLDivElement>('#outputPanel');
 const resultPanel = requiredElement<HTMLDivElement>('#resultPanel');
+const animationPanel = requiredElement<HTMLElement>('#animationPanel');
+const animationTitle = requiredElement<HTMLElement>('#animationTitle');
+const animationFrame = requiredElement<HTMLIFrameElement>('#animationFrame');
+const animationCloseButton = requiredElement<HTMLButtonElement>('#animationCloseButton');
+const streamPanel = requiredElement<HTMLElement>('#streamPanel');
+const streamContent = requiredElement<HTMLPreElement>('#streamContent');
+const aiChatInput = requiredElement<HTMLTextAreaElement>('#aiChatInput');
+const aiChatSendButton = requiredElement<HTMLButtonElement>('#aiChatSendButton');
 
 argsInput.value = defaultArgs;
 let selectedProblemId = problems[0].id;
@@ -440,6 +511,7 @@ const editor = monaco.editor.create(editorElement, {
   fontSize: 14,
   minimap: { enabled: false },
   scrollBeyondLastLine: false,
+  wordWrap: 'on',
   lineNumbersMinChars: 3,
   glyphMargin: true,
   padding: { top: 14, bottom: 14 },
@@ -452,6 +524,9 @@ let resumeCurrentPause: (() => void) | null = null;
 let resumeMode: ResumeMode = 'continue';
 let stopped = false;
 let currentDebugVariables: Record<string, unknown> | null = null;
+let debugStepCounter = 0;
+let debugMatrixPath: Array<{ row: number; col: number; step: number }> = [];
+let explainNextDebugPause = false;
 
 monaco.languages.registerHoverProvider('javascript', {
   provideHover(model, position) {
@@ -655,7 +730,10 @@ function buildLeetCodeSearchFilters(query: string) {
     };
   }
 
-  return baseFilters;
+  return {
+    ...baseFilters,
+    searchKeywords: trimmedQuery,
+  };
 }
 
 function questionSummaryToProblem(question: LeetCodeQuestionSummary): Problem {
@@ -751,6 +829,7 @@ async function loadProblem(problem: Problem) {
   setRunState('idle');
   lineText.textContent = '-';
   resultPanel.textContent = 'No result yet.';
+  clearStreamingOutput();
   outputPanel.textContent = problem.titleSlug ? 'Loading official solution from alfa-leetcode-api...' : 'No output yet.';
   renderVariables(null);
 
@@ -770,20 +849,17 @@ async function loadProblem(problem: Problem) {
     resetBreakpoints();
   }
 
-  // Include problem description (from LeetCode GraphQL) above any assistant text or status message.
-  const desc = loadedProblem.description ? `${formatProblemDescription(loadedProblem.description)}\n\n` : '';
+  // Keep Output focused on the problem description. Solutions go directly into the editor.
   try {
     const assistantKey = loadedProblem.titleSlug ?? String(loadedProblem.id);
     const assistantText = assistantTextByProblem.get(assistantKey);
     if (assistantText) {
-      let movedAssistantCode = false;
       try {
         const extracted = extractAssistantJavaScript(assistantText || '');
         if (extracted && extracted.trim()) {
           const normalized = normalizeLeetCodeJavaScript(extracted);
           editor.setValue(normalized);
           resetBreakpoints();
-          movedAssistantCode = true;
 
           // Update loadedProblem so state and caching reflect the inserted code
           loadedProblem.code = normalized;
@@ -793,14 +869,10 @@ async function loadProblem(problem: Problem) {
       } catch (e) {
         // ignore extraction errors
       }
-
-      renderOutputWithImages(desc + (movedAssistantCode ? getProblemLoadMessage(loadedProblem) : assistantText));
-    } else {
-      renderOutputWithImages(desc + getProblemLoadMessage(loadedProblem));
     }
+    renderProblemDescription(loadedProblem);
   } catch (e) {
-    // fallback to message-only if anything goes wrong
-    renderOutputWithImages(desc + getProblemLoadMessage(loadedProblem));
+    renderProblemDescription(loadedProblem);
   }
 
   cacheLoadedProblem(loadedProblem);
@@ -812,6 +884,22 @@ function cacheLoadedProblem(loadedProblem: Problem) {
     const sameProblem = problem.id === loadedProblem.id || (problem.titleSlug && problem.titleSlug === loadedProblem.titleSlug);
     return sameProblem ? loadedProblem : problem;
   });
+}
+
+function clearStreamingOutput() {
+  streamPanel.classList.add('hidden');
+  streamContent.textContent = '';
+}
+
+function showStreamingOutput(content: string) {
+  streamPanel.classList.remove('hidden');
+  streamContent.textContent = content || 'Waiting for assistant response...';
+  streamContent.scrollTop = streamContent.scrollHeight;
+}
+
+function renderProblemDescription(problem: Problem) {
+  const desc = problem.description ? `${formatProblemDescription(problem.description)}\n\n` : '';
+  renderOutputWithImages(desc || 'No description available.');
 }
 
 async function fetchProblemWithOfficialSolution(problem: Problem) {
@@ -838,11 +926,12 @@ async function fetchProblemWithOfficialSolution(problem: Problem) {
   }
 
   const deepSeekBaseProblem = detail ?? localFallback ?? problem;
+  renderProblemDescription(deepSeekBaseProblem);
   const deepSeekCode = await fetchDeepSeekSolution(deepSeekBaseProblem).catch(() => null);
   if (deepSeekCode && isUsefulSolutionCode(deepSeekCode)) {
     return {
       ...deepSeekBaseProblem,
-      code: normalizeLeetCodeJavaScript(deepSeekCode),
+      code: deepSeekCode,
       source: 'deepseek' as const,
       isStarter: false,
     };
@@ -903,6 +992,11 @@ async function fetchAlfaOfficialSolutionCode(titleSlug: string) {
 
 function buildDeepSeekPrompt(problem: Problem): string {
   return [
+    'Return a JavaScript solution only.',
+    'Use LeetCode JavaScript format: function solution(...) { ... }.',
+    'Do not write Python, Java, C++, TypeScript, pseudocode, or multiple language versions.',
+    'Put the final JavaScript code in one ```javascript fenced block. Explanations are optional and must not contain code in other languages.',
+    '',
     `Title: ${problem.title ?? ''}`,
     `LeetCode ID: ${problem.id ?? ''}`,
     `Slug: ${problem.titleSlug ?? ''}`,
@@ -918,10 +1012,246 @@ function buildDeepSeekPrompt(problem: Problem): string {
   ].join('\n');
 }
 
+async function sendAiChatMessage() {
+  const message = aiChatInput.value.trim();
+  if (!message) {
+    return;
+  }
+
+  aiChatSendButton.disabled = true;
+  showStreamingOutput('');
+
+  try {
+    const context = [
+      'User question:',
+      message,
+      '',
+      'Current code:',
+      editor.getValue(),
+      '',
+      'Current function arguments:',
+      argsInput.value,
+    ].join('\n');
+
+    await streamOllamaChat(context);
+    aiChatInput.value = '';
+  } catch (error) {
+    showStreamingOutput(error instanceof Error ? error.message : String(error));
+  } finally {
+    aiChatSendButton.disabled = false;
+  }
+}
+
+async function streamOllamaChat(prompt: string) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: (window as any).OLLAMA_MODEL ?? 'llama3.2:latest',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.2,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama request failed with ${response.status}.`);
+  }
+
+  let content = '';
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text();
+    showStreamingOutput(text);
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const chunk = extractOllamaChunk(line);
+      if (chunk) {
+        content += chunk;
+        showStreamingOutput(content);
+      }
+    }
+  }
+
+  const finalChunk = extractOllamaChunk(buffer);
+  if (finalChunk) {
+    content += finalChunk;
+    showStreamingOutput(content);
+  }
+
+  return content;
+}
+
+async function explainDebugVariables(snapshot: DebugSnapshot) {
+  const requestId = ++debugExplanationRequestId;
+  showStreamingOutput('Explaining current debug step...');
+
+  try {
+    await streamDebugExplanation(buildDebugExplanationPrompt(snapshot), requestId);
+  } catch (error) {
+    if (requestId === debugExplanationRequestId) {
+      showStreamingOutput(`Debug explanation unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+async function streamDebugExplanation(prompt: string, requestId: number) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: (window as any).OLLAMA_MODEL ?? 'llama3.2:latest',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 140,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama request failed with ${response.status}.`);
+  }
+
+  let content = '';
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text();
+    if (requestId === debugExplanationRequestId) {
+      showStreamingOutput(limitWords(text, 100));
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const chunk = extractOllamaChunk(line);
+      if (chunk) {
+        content += chunk;
+        if (requestId === debugExplanationRequestId) {
+          showStreamingOutput(limitWords(content, 100));
+        }
+      }
+    }
+  }
+
+  const finalChunk = extractOllamaChunk(buffer);
+  if (finalChunk) {
+    content += finalChunk;
+  }
+
+  if (requestId === debugExplanationRequestId) {
+    showStreamingOutput(limitWords(content, 100));
+  }
+
+  return content;
+}
+
+function buildDebugExplanationPrompt(snapshot: DebugSnapshot) {
+  return [
+    'Explain this JavaScript debug step in no more than 100 words.',
+    'Be concrete and quick. Mention the current line and the important variable changes/state.',
+    'If a DP matrix is present, explain the current cell and what it represents.',
+    'Do not include code.',
+    '',
+    `Current line: ${snapshot.line}`,
+    'Variables from monitor:',
+    summarizeDebugVariables(snapshot.variables),
+  ].join('\n');
+}
+
+function summarizeDebugVariables(variables: Record<string, unknown>) {
+  const entries = Object.entries(variables)
+    .filter(([, value]) => value !== '[unavailable]' && typeof value !== 'function')
+    .slice(0, 14)
+    .map(([name, value]) => `${name}: ${compactDebugValue(value)}`);
+
+  const matrixContext = summarizeMatrixDebugContext(variables);
+  const text = [matrixContext, entries.join('\n')].filter(Boolean).join('\n');
+  return text.length > 3500 ? `${text.slice(0, 3500)}\n...` : text || 'No variables captured.';
+}
+
+function summarizeMatrixDebugContext(variables: Record<string, unknown>) {
+  const indexes = getVisibleIndexes(variables);
+  const coordinate = getMatrixCoordinate(indexes);
+  const matrices = Object.entries(variables).filter(([name, value]) => {
+    return Array.isArray(value) && isRectangularPrimitiveMatrix(value) && isDynamicProgrammingMatrixName(name);
+  });
+
+  if (matrices.length === 0) {
+    return '';
+  }
+
+  const matrixSummaries = matrices.slice(0, 3).map(([name, value]) => {
+    const matrix = value as unknown[][];
+    const rows = matrix.length;
+    const cols = matrix[0]?.length ?? 0;
+    const parts = [`DP matrix ${name}: ${rows}x${cols}`];
+    if (coordinate && coordinate.row < rows && coordinate.col < cols) {
+      parts.push(`current cell ${name}[${coordinate.row}][${coordinate.col}] = ${stringifyValue(matrix[coordinate.row][coordinate.col])}`);
+    }
+    return parts.join(', ');
+  });
+
+  return matrixSummaries.join('\n');
+}
+
+function compactDebugValue(value: unknown) {
+  let text = stringifyValue(value);
+  text = text.replace(/\s+/g, ' ').trim();
+  return text.length > 420 ? `${text.slice(0, 420)}...` : text;
+}
+
+function limitWords(text: string, maxWords: number) {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  return words.length > maxWords ? `${words.slice(0, maxWords).join(' ')}...` : text.trim();
+}
+
+function extractOllamaChunk(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  try {
+    const json = JSON.parse(trimmed);
+    return String(
+      json.message?.content ?? json.output ?? json.text ?? json.content ?? json.data ??
+      (Array.isArray(json.choices) && (json.choices[0]?.message?.content ?? json.choices[0]?.content ?? json.choices[0]?.text)) ??
+      (Array.isArray(json.results) && json.results[0]?.content) ?? '',
+    );
+  } catch {
+    return '';
+  }
+}
+
 async function fetchDeepSeekSolution(problem: Problem) {
   // Use the same-origin proxy so the browser never sends CORS preflight requests to Ollama directly.
-  outputPanel.textContent = 'Generating leetcode JavaScript solution with Ollama...';
-
+  showStreamingOutput('');
   const prompt = buildDeepSeekPrompt(problem);
 
   const endpoints = [
@@ -974,10 +1304,7 @@ async function fetchDeepSeekSolution(problem: Problem) {
 
               if (chunk) {
                 content += String(chunk);
-                // show streaming progress briefly
-                try {
-                  outputPanel.textContent = 'Generating (streaming)...\n' + content.slice(0, 1000);
-                } catch {}
+                showStreamingOutput(content);
               }
 
               if (json.done) {
@@ -999,6 +1326,7 @@ async function fetchDeepSeekSolution(problem: Problem) {
               (Array.isArray(json.choices) && (json.choices[0]?.message?.content ?? json.choices[0]?.content ?? json.choices[0]?.text)) ??
               (Array.isArray(json.results) && json.results[0]?.content) ?? '';
             if (chunk) content += String(chunk);
+            if (chunk) showStreamingOutput(content);
           } catch (e) {
             // ignore
           }
@@ -1035,6 +1363,14 @@ async function fetchDeepSeekSolution(problem: Problem) {
         }
 
         const code = extractAssistantJavaScript(raw);
+        if (code?.trim()) {
+          const normalized = normalizeLeetCodeJavaScript(code);
+          editor.setValue(normalized);
+          resetBreakpoints();
+          showStreamingOutput(extractAssistantExplanation(raw, normalized) || 'Solution moved to code editor.');
+          return normalized;
+        }
+        showStreamingOutput(raw);
         return code;
       }
     } catch (err) {
@@ -1043,7 +1379,6 @@ async function fetchDeepSeekSolution(problem: Problem) {
   }
 
   // Fallback: call local Vite middleware that invokes the ollama CLI
-  outputPanel.textContent = 'Generating JavaScript solution with Ollama (CLI)...';
   try {
     const response = await fetch('/ollama/solution', {
       method: 'POST',
@@ -1081,10 +1416,20 @@ function extractPlaygroundIds(content: string) {
 function extractAssistantJavaScript(content: string): string {
   if (!content) return '';
 
-  // Prefer fenced JavaScript code blocks
-  const fenced = content.match(/```(?:javascript|js)?\s*([\s\S]*?)```/i);
-  if (fenced && fenced[1] && fenced[1].trim()) {
-    return fenced[1].trim();
+  const fencedBlocks = [...content.matchAll(/```([A-Za-z0-9_-]*)\s*\n?([\s\S]*?)```/g)];
+  const javascriptBlock = fencedBlocks.find((match) => isJavaScriptFenceLanguage(match[1]) && looksLikeJavaScriptCode(match[2]));
+  if (javascriptBlock?.[2]?.trim()) {
+    return javascriptBlock[2].trim();
+  }
+
+  const unlabeledJavaScriptBlock = fencedBlocks.find((match) => !match[1] && looksLikeJavaScriptCode(match[2]));
+  if (unlabeledJavaScriptBlock?.[2]?.trim()) {
+    return unlabeledJavaScriptBlock[2].trim();
+  }
+
+  const hasNonJavaScriptFencedCode = fencedBlocks.some((match) => match[1] && !isJavaScriptFenceLanguage(match[1]));
+  if (hasNonJavaScriptFencedCode) {
+    return '';
   }
 
   // Remove lines that are plain JSON objects (NDJSON from streaming) to reduce noise
@@ -1094,17 +1439,12 @@ function extractAssistantJavaScript(content: string): string {
     .join('\n')
     .trim();
 
-  // Try fenced block again on cleaned content
-  const fenced2 = cleanedLines.match(/```(?:javascript|js)?\s*([\s\S]*?)```/i);
-  if (fenced2 && fenced2[1] && fenced2[1].trim()) {
-    return fenced2[1].trim();
-  }
-
   // If no fences, heuristically find code start (function, const, let, class)
   const codeStartMatch = cleanedLines.match(/(^|\n)\s*(function|const|let|class)\s+/m);
   if (codeStartMatch) {
     const idx = cleanedLines.indexOf(codeStartMatch[0].trim());
-    return cleanedLines.slice(idx).trim();
+    const candidate = cleanedLines.slice(idx).trim();
+    return looksLikeJavaScriptCode(candidate) ? candidate : '';
   }
 
   // Fallback: return cleaned content but strip any leading assistant prose lines
@@ -1112,11 +1452,100 @@ function extractAssistantJavaScript(content: string): string {
   const lines = cleanedLines.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     if (/^\s*(function|const|let|class|\/\*|\/\/|\{)/.test(lines[i])) {
-      return lines.slice(i).join('\n').trim();
+      const candidate = lines.slice(i).join('\n').trim();
+      return looksLikeJavaScriptCode(candidate) ? candidate : '';
     }
   }
 
-  return cleanedLines;
+  return looksLikeJavaScriptCode(cleanedLines) ? cleanedLines : '';
+}
+
+function isJavaScriptFenceLanguage(language: string) {
+  return /^(?:javascript|js|node|nodejs)$/i.test(language.trim());
+}
+
+function looksLikeJavaScriptCode(code: string) {
+  const stripped = code.trim();
+  if (!stripped) {
+    return false;
+  }
+
+  if (/^\s*(?:def|class\s+\w+\s*:|from\s+\w+\s+import|import\s+\w+|#include|public\s+class|class\s+Solution\s*\{|using\s+namespace)\b/m.test(stripped)) {
+    return false;
+  }
+
+  return /\bfunction\s+[A-Za-z_$][\w$]*\s*\(|\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=|=>|\bnew\s+(?:Map|Set|Array|TreeNode|ListNode)\b|\bconsole\.|\bMath\./.test(stripped);
+}
+
+function buildCommentedAssistantSolution(assistantText: string, solutionCode: string) {
+  const commentText = extractAssistantExplanation(assistantText, solutionCode);
+  if (!commentText) {
+    return solutionCode;
+  }
+
+  return `${toBlockComment(commentText)}\n\n${solutionCode}`;
+}
+
+function extractAssistantExplanation(assistantText: string, solutionCode: string) {
+  const withoutFencedCode = assistantText
+    .replace(/```(?:javascript|js)?\s*[\s\S]*?```/gi, '')
+    .replace(/\r\n/g, '\n')
+    .trim();
+
+  if (withoutFencedCode) {
+    return withoutFencedCode;
+  }
+
+  const normalizedCodeStart = solutionCode.trim().split('\n')[0]?.trim();
+  if (!normalizedCodeStart) {
+    return assistantText.trim();
+  }
+
+  const codeStartIndex = assistantText.indexOf(normalizedCodeStart);
+  return (codeStartIndex > 0 ? assistantText.slice(0, codeStartIndex) : '').trim();
+}
+
+function toBlockComment(text: string) {
+  const sanitized = text.replace(/\*\//g, '* /').trim();
+  return [
+    '/*',
+    ...sanitized.split(/\r?\n/).flatMap((line) => {
+      const wrappedLines = wrapCommentLine(line, 88);
+      return wrappedLines.length ? wrappedLines.map((wrappedLine) => ` * ${wrappedLine}`) : [' *'];
+    }),
+    ' */',
+  ].join('\n');
+}
+
+function wrapCommentLine(line: string, maxLength: number) {
+  const trimmedLine = line.trim();
+  if (!trimmedLine) {
+    return [];
+  }
+
+  const words = trimmedLine.split(/\s+/);
+  const lines: string[] = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    if (!currentLine) {
+      currentLine = word;
+      continue;
+    }
+
+    if (`${currentLine} ${word}`.length > maxLength) {
+      lines.push(currentLine);
+      currentLine = word;
+    } else {
+      currentLine += ` ${word}`;
+    }
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
 }
 
 function renderOutputWithImages(raw: string) {
@@ -1374,8 +1803,17 @@ runButton.addEventListener('click', () => {
   void runCode();
 });
 
+visualizeButton.addEventListener('click', () => {
+  void visualizeCurrentInput();
+});
+
+animationCloseButton.addEventListener('click', () => {
+  hideAnimationPanel();
+});
+
 resumeButton.addEventListener('click', () => {
   resumeMode = 'continue';
+  explainNextDebugPause = false;
   resumeCurrentPause?.();
 });
 
@@ -1396,8 +1834,20 @@ stopButton.addEventListener('click', () => {
   setRunState('idle');
 });
 
+aiChatSendButton.addEventListener('click', () => {
+  void sendAiChatMessage();
+});
+
+aiChatInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    void sendAiChatMessage();
+  }
+});
+
 function stepToNextLine() {
   resumeMode = 'step';
+  explainNextDebugPause = true;
   if (resumeCurrentPause) {
     resumeCurrentPause();
     return;
@@ -1408,9 +1858,104 @@ function stepToNextLine() {
   }
 }
 
+async function visualizeCurrentInput() {
+  visualizeButton.disabled = true;
+  outputPanel.textContent = 'Loading interactive animation...';
+
+  try {
+    const selectedProblem = getSelectedProblem();
+    if (!selectedProblem) {
+      throw new Error('Select a LeetCode problem before opening animation.');
+    }
+
+    const result = await findInteractiveAnimation(selectedProblem);
+    renderInteractiveAnimation(result.htmlPath, selectedProblem);
+    outputPanel.textContent = `Loaded animation: ${result.htmlPath}`;
+  } catch (error) {
+    outputPanel.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    visualizeButton.disabled = false;
+  }
+}
+
+async function findInteractiveAnimation(problem: Problem) {
+  const response = await fetch(`/algorithm/interactive?problemId=${encodeURIComponent(String(problem.id))}`);
+  const payload = (await response.json()) as AlgorithmInteractiveResponse;
+  if (!response.ok || !payload.htmlPath) {
+    throw new Error(payload.error ?? `Animation request failed with ${response.status}.`);
+  }
+
+  return { htmlPath: payload.htmlPath };
+}
+
+function renderInteractiveAnimation(htmlPath: string, problem: Problem) {
+  animationTitle.textContent = `${problem.id}. ${problem.title}`;
+  animationFrame.src = `${htmlPath}?t=${Date.now()}`;
+  animationPanel.classList.remove('hidden');
+}
+
+function hideAnimationPanel() {
+  animationFrame.removeAttribute('src');
+  animationPanel.classList.add('hidden');
+}
+
+async function generateAlgorithmGif(arrayData: unknown[], className: string) {
+  const response = await fetch('/algorithm/gif', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ arrayData, className }),
+  });
+
+  const payload = (await response.json()) as AlgorithmGifResponse;
+  if (!response.ok || !payload.gifPath) {
+    throw new Error([payload.error ?? `GIF request failed with ${response.status}.`, payload.stderr].filter(Boolean).join('\n'));
+  }
+
+  return { gifPath: payload.gifPath, warning: payload.warning ?? '' };
+}
+
+function extractFirstVisualizableArray(args: unknown[]) {
+  if (args.every(isPrimitiveVisualizationValue)) {
+    return args;
+  }
+
+  const firstArray = args.find((arg): arg is unknown[] => Array.isArray(arg) && arg.every(isPrimitiveVisualizationValue));
+  if (!firstArray) {
+    throw new Error('No primitive array found to visualize. Example: [[3, 1, 4, 2]].');
+  }
+
+  return firstArray;
+}
+
+function isPrimitiveVisualizationValue(value: unknown) {
+  return ['number', 'string', 'boolean'].includes(typeof value);
+}
+
+function getVisualizationClassName(problem: Problem | null) {
+  const text = normalizeSearchText(`${problem?.title ?? ''} ${problem?.titleSlug ?? ''} ${(problem?.tags ?? []).join(' ')}`);
+  return /\b(sort|sorting|quick sort|quicksort)\b/.test(text) ? 'QuickSortVisualization' : 'ArrayVisualization';
+}
+
+function renderGeneratedGif(gifPath: string, arrayData: unknown[], className: string, warning = '') {
+  outputPanel.innerHTML = '';
+
+  const details = document.createElement('pre');
+  details.textContent = [`Generated ${className}`, `Input: ${JSON.stringify(arrayData)}`, warning].filter(Boolean).join('\n');
+
+  const image = document.createElement('img');
+  image.src = `${gifPath}?t=${Date.now()}`;
+  image.alt = `${className} GIF`;
+  image.className = 'generated-gif';
+
+  outputPanel.append(details, image);
+}
+
 async function runCode(initialMode: ResumeMode = 'continue') {
   stopped = false;
   resumeMode = initialMode;
+  explainNextDebugPause = initialMode === 'step';
+  debugStepCounter = 0;
+  debugMatrixPath = [];
   setRunState('running');
   resultPanel.textContent = 'Running...';
   lineText.textContent = '-';
@@ -1440,17 +1985,19 @@ async function runCode(initialMode: ResumeMode = 'continue') {
       factory = new Function(
         '__debug__',
         'TreeNode',
+        'ListNode',
         `${instrumentedCode}\n${setupCode}\nreturn typeof solution === 'function' ? solution.bind(null, ${varName}) : null;`,
       );
     } else {
       factory = new Function(
         '__debug__',
         'TreeNode',
+        'ListNode',
         `${instrumentedCode}\nreturn typeof solution === 'function' ? solution : null;`,
       );
     }
 
-    const solution = factory(handleProbe, TreeNode) as ((...args: unknown[]) => unknown) | null;
+    const solution = factory(handleProbe, TreeNode, ListNode) as ((...args: unknown[]) => unknown) | null;
     if (!solution) {
       throw new Error('Define a function named solution.');
     }
@@ -1500,7 +2047,16 @@ function parseArguments(input: string): unknown[] | { __setup: string } {
 function buildSolutionInvocations(args: unknown[], code: string): unknown[][] {
   const paramNames = getSolutionParamNames(code);
   const treeParamNames = getTreeParamNames(code);
+  const listParamNames = getListParamNames(code);
   const selectedProblem = getSelectedProblem();
+
+  if (paramNames.length === 1 && shouldConvertArgumentToListCollection(paramNames[0], args, selectedProblem, listParamNames)) {
+    return [[args.map((listValues) => buildLinkedListFromArray(listValues as unknown[]))]];
+  }
+
+  if (paramNames.length === 1 && shouldConvertArgumentToList(paramNames[0], args, selectedProblem, listParamNames)) {
+    return [[buildLinkedListFromArray(args)]];
+  }
 
   if (paramNames.length === 1 && shouldConvertArgumentToTree(paramNames[0], args, selectedProblem, paramNames, treeParamNames)) {
     return [[buildBinaryTreeFromLevelOrder(args)]];
@@ -1515,6 +2071,14 @@ function buildSolutionInvocations(args: unknown[], code: string): unknown[][] {
   }
 
   return [args.map((arg, index) => {
+    if (shouldConvertArgumentToListCollection(paramNames[index], arg, selectedProblem, listParamNames)) {
+      return (arg as unknown[]).map((listValues) => buildLinkedListFromArray(listValues as unknown[]));
+    }
+
+    if (shouldConvertArgumentToList(paramNames[index], arg, selectedProblem, listParamNames)) {
+      return buildLinkedListFromArray(arg as unknown[]);
+    }
+
     return shouldConvertArgumentToTree(paramNames[index], arg, selectedProblem, paramNames, treeParamNames)
       ? buildBinaryTreeFromLevelOrder(arg as unknown[])
       : arg;
@@ -1549,6 +2113,16 @@ function getTreeParamNames(code: string) {
   return names;
 }
 
+function getListParamNames(code: string) {
+  const names = new Set<string>();
+  const listParamPattern = /@param\s*\{[^}]*ListNode[^}]*}\s+([A-Za-z_$][\w$]*)/g;
+  for (const match of code.matchAll(listParamPattern)) {
+    names.add(match[1]);
+  }
+
+  return names;
+}
+
 function getSelectedProblem() {
   return problems.find((problem) => problem.id === selectedProblemId) ?? null;
 }
@@ -1577,8 +2151,73 @@ function shouldConvertArgumentToTree(
   return paramNames.length === 1 && /\b(binary tree|tree)\b/.test(problemText);
 }
 
+function shouldConvertArgumentToListCollection(
+  paramName: string | undefined,
+  value: unknown,
+  problem: Problem | null,
+  listParamNames: Set<string>,
+) {
+  if (!Array.isArray(value) || !value.every((item) => Array.isArray(item) && isListValuesInput(item))) {
+    return false;
+  }
+
+  const normalizedParamName = normalizeSearchText(paramName ?? '');
+  if (paramName && listParamNames.has(paramName)) {
+    return true;
+  }
+
+  if (normalizedParamName === 'lists' || normalizedParamName.endsWith('lists')) {
+    return true;
+  }
+
+  const problemText = normalizeSearchText(`${problem?.title ?? ''} ${problem?.titleSlug ?? ''} ${(problem?.tags ?? []).join(' ')}`);
+  return /\blinked list\b/.test(problemText) && /\bmerge k sorted lists\b/.test(problemText);
+}
+
+function shouldConvertArgumentToList(
+  paramName: string | undefined,
+  value: unknown,
+  problem: Problem | null,
+  listParamNames: Set<string>,
+) {
+  if (!Array.isArray(value) || !isListValuesInput(value)) {
+    return false;
+  }
+
+  const normalizedParamName = normalizeSearchText(paramName ?? '');
+  if (paramName && listParamNames.has(paramName)) {
+    return true;
+  }
+
+  if (normalizedParamName === 'head' || normalizedParamName.endsWith('head') || normalizedParamName.includes('list')) {
+    return true;
+  }
+
+  const problemText = normalizeSearchText(`${problem?.title ?? ''} ${problem?.titleSlug ?? ''} ${(problem?.tags ?? []).join(' ')}`);
+  return /\blinked list\b/.test(problemText);
+}
+
+function isListValuesInput(value: unknown[]) {
+  return value.every((item) => item === null || ['number', 'string', 'boolean'].includes(typeof item));
+}
+
 function isLevelOrderTreeInput(value: unknown[]) {
   return value.every((item) => item === null || ['number', 'string', 'boolean'].includes(typeof item));
+}
+
+function buildLinkedListFromArray(values: unknown[]) {
+  const dummy = new ListNode();
+  let tail = dummy;
+  for (const value of values) {
+    if (value === null) {
+      continue;
+    }
+
+    tail.next = new ListNode(value);
+    tail = tail.next;
+  }
+
+  return dummy.next;
 }
 
 function buildBinaryTreeFromLevelOrder(values: unknown[]) {
@@ -1626,6 +2265,8 @@ async function handleProbe(snapshot: DebugSnapshot) {
   }
 
   resumeMode = 'continue';
+  debugStepCounter += 1;
+  recordMatrixDebugStep(snapshot.variables);
   setRunState('paused');
   lineText.textContent = String(snapshot.line);
   setActiveLine(snapshot.line);
@@ -1633,6 +2274,10 @@ async function handleProbe(snapshot: DebugSnapshot) {
   editor.setPosition({ lineNumber: snapshot.line, column: 1 });
   currentDebugVariables = snapshot.variables;
   renderVariables(snapshot.variables);
+  if (explainNextDebugPause) {
+    explainNextDebugPause = false;
+    void explainDebugVariables(snapshot);
+  }
 
   await new Promise<void>((resolve) => {
     resumeCurrentPause = () => {
@@ -1831,7 +2476,7 @@ function renderVariables(variables: Record<string, unknown> | null) {
     label.textContent = name;
 
     const code = document.createElement('code');
-    code.append(renderVariableValue(value, indexByName, highlightedTreeNodes));
+    code.append(renderVariableValue(value, indexByName, highlightedTreeNodes, name));
 
     row.append(label, code);
     return row;
@@ -1845,7 +2490,7 @@ function renderVariables(variables: Record<string, unknown> | null) {
 
 function getVisibleIndexes(variables: Record<string, unknown>) {
   const result = new Map<string, number>();
-  for (const name of ['i', 'j', 'k', 'left', 'right', 'mid']) {
+  for (const name of ['i', 'j', 'k', 'left', 'right', 'mid', 'row', 'col', 'r', 'c', 'x', 'y']) {
     const value = variables[name];
     if (Number.isInteger(value) && Number(value) >= 0) {
       result.set(name, Number(value));
@@ -1853,6 +2498,43 @@ function getVisibleIndexes(variables: Record<string, unknown>) {
   }
 
   return result;
+}
+
+function recordMatrixDebugStep(variables: Record<string, unknown>) {
+  const indexes = getVisibleIndexes(variables);
+  const coordinate = getMatrixCoordinate(indexes);
+  if (!coordinate) {
+    return;
+  }
+
+  const last = debugMatrixPath[debugMatrixPath.length - 1];
+  if (last?.row === coordinate.row && last.col === coordinate.col) {
+    last.step = debugStepCounter;
+    return;
+  }
+
+  debugMatrixPath.push({ ...coordinate, step: debugStepCounter });
+}
+
+function getMatrixCoordinate(indexes: Map<string, number>) {
+  const row = indexes.get('i') ?? indexes.get('row') ?? indexes.get('r') ?? indexes.get('x');
+  const col = indexes.get('j') ?? indexes.get('col') ?? indexes.get('c') ?? indexes.get('y') ?? indexes.get('k');
+  if (typeof row !== 'number' || typeof col !== 'number') {
+    return null;
+  }
+
+  return { row, col };
+}
+
+function getMatrixPathStep(row: number, col: number) {
+  for (let index = debugMatrixPath.length - 1; index >= 0; index -= 1) {
+    const entry = debugMatrixPath[index];
+    if (entry.row === row && entry.col === col) {
+      return entry.step;
+    }
+  }
+
+  return null;
 }
 
 function getHighlightedTreeNodes(variables: Record<string, unknown>) {
@@ -1902,9 +2584,13 @@ function findRootTreeNode(variables: Record<string, unknown>) {
   return isTreeNode(treeEntry?.[1]) ? treeEntry[1] : null;
 }
 
-function renderVariableValue(value: unknown, indexes: Map<string, number>, highlightedTreeNodes: Set<TreeNode>) {
+function renderVariableValue(value: unknown, indexes: Map<string, number>, highlightedTreeNodes: Set<TreeNode>, variableName?: string) {
   if (isTreeNode(value)) {
     return renderTreeDiagram(value, highlightedTreeNodes);
+  }
+
+  if (isListNode(value)) {
+    return document.createTextNode(stringifyValue(listNodeToArray(value)));
   }
 
   if (!Array.isArray(value)) {
@@ -1914,37 +2600,7 @@ function renderVariableValue(value: unknown, indexes: Map<string, number>, highl
   // Detect rectangular primitive matrices. Jagged nested arrays are usually adjacency lists.
   const is2D = isRectangularPrimitiveMatrix(value);
   if (is2D) {
-    const table = document.createElement('table');
-    table.className = 'array-table';
-
-    // Determine max columns
-    const rows = (value as unknown[][]).map((r) => Array.isArray(r) ? r : [r]);
-    const cols = Math.max(0, ...rows.map((r) => r.length));
-
-    // Build table body
-    const tbody = document.createElement('tbody');
-    rows.forEach((r, rowIndex) => {
-      const tr = document.createElement('tr');
-      for (let c = 0; c < cols; c++) {
-        const td = document.createElement('td');
-        const cellVal = c < r.length ? r[c] : undefined;
-        td.append(renderVariableValue(cellVal, indexes, highlightedTreeNodes));
-
-        // Highlight cell if indexes contain i and j matching
-        const i = indexes.get('i') ?? indexes.get('row') ?? indexes.get('r');
-        const j = indexes.get('j') ?? indexes.get('col') ?? indexes.get('c') ?? indexes.get('k');
-        if (i === rowIndex && j === c) {
-          td.className = 'current-array-element';
-          td.title = `Current index: ${[...indexes.entries()].filter(([, v]) => v === rowIndex || v === c).map(([n]) => n).join(', ')}`;
-        }
-
-        tr.appendChild(td);
-      }
-      tbody.appendChild(tr);
-    });
-
-    table.appendChild(tbody);
-    return table;
+    return renderMatrixValue(value as unknown[][], indexes, highlightedTreeNodes, variableName);
   }
 
   // Fallback: 1D array rendering with highlights
@@ -1973,6 +2629,103 @@ function renderVariableValue(value: unknown, indexes: Map<string, number>, highl
   return wrapper;
 }
 
+function renderMatrixValue(
+  rows: unknown[][],
+  indexes: Map<string, number>,
+  highlightedTreeNodes: Set<TreeNode>,
+  variableName?: string,
+) {
+  const wrapper = document.createElement('div');
+  wrapper.className = isDynamicProgrammingMatrixName(variableName ?? '') ? 'matrix-monitor dp-matrix-monitor' : 'matrix-monitor';
+
+  if (variableName) {
+    const coordinate = getMatrixCoordinate(indexes);
+    const cols = rows[0]?.length ?? 0;
+    const header = document.createElement('div');
+    header.className = 'matrix-monitor-header';
+    header.textContent = isDynamicProgrammingMatrixName(variableName)
+      ? `DP Matrix: ${variableName} (${rows.length} x ${cols})`
+      : `Matrix: ${variableName} (${rows.length} x ${cols})`;
+
+    if (coordinate && coordinate.row < rows.length && coordinate.col < cols) {
+      const detail = document.createElement('span');
+      detail.className = 'matrix-monitor-current';
+      detail.textContent = `${variableName}[${coordinate.row}][${coordinate.col}] = ${stringifyValue(rows[coordinate.row][coordinate.col])}`;
+      header.append(detail);
+    }
+
+    wrapper.append(header);
+  }
+
+  const table = document.createElement('table');
+  table.className = 'array-table matrix-table';
+
+  const cols = Math.max(0, ...rows.map((r) => r.length));
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  const corner = document.createElement('th');
+  corner.className = 'array-row-index matrix-corner';
+  corner.textContent = '';
+  headRow.append(corner);
+
+  for (let colIndex = 0; colIndex < cols; colIndex += 1) {
+    const th = document.createElement('th');
+    th.className = 'array-row-index';
+    th.textContent = String(colIndex);
+    headRow.append(th);
+  }
+
+  thead.append(headRow);
+  table.append(thead);
+
+  const tbody = document.createElement('tbody');
+  rows.forEach((row, rowIndex) => {
+    const tr = document.createElement('tr');
+    const rowHeader = document.createElement('th');
+    rowHeader.className = 'array-row-index';
+    rowHeader.textContent = String(rowIndex);
+    tr.append(rowHeader);
+
+    for (let colIndex = 0; colIndex < cols; colIndex += 1) {
+      const td = document.createElement('td');
+      const cellVal = colIndex < row.length ? row[colIndex] : undefined;
+      td.append(renderVariableValue(cellVal, indexes, highlightedTreeNodes));
+
+      const pathStep = getMatrixPathStep(rowIndex, colIndex);
+      if (pathStep !== null) {
+        td.classList.add('dfs-path-element');
+        const pathBadge = document.createElement('span');
+        pathBadge.className = 'dfs-path-step';
+        pathBadge.textContent = String(pathStep);
+        td.append(pathBadge);
+      }
+
+      const coordinate = getMatrixCoordinate(indexes);
+      if (coordinate?.row === rowIndex && coordinate.col === colIndex) {
+        td.className = 'current-array-element';
+        td.querySelector('.dfs-path-step')?.remove();
+        td.title = `Current cell: ${[...indexes.entries()].filter(([, v]) => v === rowIndex || v === colIndex).map(([n]) => n).join(', ')}`;
+        const step = document.createElement('span');
+        step.className = 'current-array-step';
+        step.textContent = String(debugStepCounter);
+        td.append(step);
+      }
+
+      tr.appendChild(td);
+    }
+
+    tbody.appendChild(tr);
+  });
+
+  table.appendChild(tbody);
+  wrapper.append(table);
+  return wrapper;
+}
+
+function isDynamicProgrammingMatrixName(name: string) {
+  return /^(?:dp|memo|cache|table|matrix|grid|cost|dist|distance|ways|count|counts|min|max)$/i.test(name);
+}
+
 function isRectangularPrimitiveMatrix(value: unknown[]) {
   if (value.length === 0 || !value.every((row) => Array.isArray(row))) {
     return false;
@@ -1997,6 +2750,34 @@ function isTreeNode(value: unknown): value is TreeNode {
     'left' in value &&
     'right' in value
   );
+}
+
+function isListNode(value: unknown): value is ListNode {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'val' in value &&
+    'next' in value &&
+    !('left' in value) &&
+    !('right' in value)
+  );
+}
+
+function listNodeToArray(head: ListNode | null) {
+  const values: unknown[] = [];
+  const seen = new Set<ListNode>();
+  let current = head;
+  while (current && !seen.has(current) && values.length < 1000) {
+    seen.add(current);
+    values.push(current.val);
+    current = current.next;
+  }
+
+  if (current) {
+    values.push('[cycle]');
+  }
+
+  return values;
 }
 
 function renderTreeDiagram(root: TreeNode, highlightedTreeNodes: Set<TreeNode>) {
@@ -2050,6 +2831,10 @@ function treeNodePreview(node: TreeNode | null): unknown {
 }
 
 function stringifyValue(value: unknown) {
+  if (isListNode(value)) {
+    return stringifyValue(listNodeToArray(value));
+  }
+
   if (value instanceof Map) {
     return JSON.stringify(Object.fromEntries(value), jsonValueReplacer, 2);
   }
@@ -2094,6 +2879,7 @@ function setRunState(state: RunState) {
   stateText.textContent = label;
   document.body.dataset.state = state;
   runButton.disabled = state === 'running' || state === 'paused';
+  visualizeButton.disabled = state === 'running' || state === 'paused';
   resumeButton.disabled = state !== 'paused';
   stepOverButton.disabled = state === 'running';
   stepInButton.disabled = state === 'running';
