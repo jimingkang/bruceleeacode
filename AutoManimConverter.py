@@ -11,9 +11,9 @@ class AutoManimConverter:
         self.js_code = js_code
         self.function_name = function_name
         self.args = args
+        self.variable_info = self._analyze_js_variables()
         self.call_args = self._normalize_call_args(args)
         self.visual_choices = self._extract_visual_choices(self.call_args)
-        self.variable_info = self._analyze_js_variables()
         self.trace = self._get_execution_trace()
         self.animation_steps = self._convert_trace_to_steps()
 
@@ -24,8 +24,21 @@ class AutoManimConverter:
             return [args]
         if len(args) == 0:
             return []
+        params = self.variable_info.get("functions", {}).get(self.function_name, [])
+        param_count = len(params)
+        if param_count == 1:
+            return [args]
         if len(args) == 1:
             return args
+        if param_count == len(args):
+            return args
+        if (
+            param_count == 3
+            and not any(isinstance(arg, (list, dict)) for arg in args)
+            and params[1] in {"left", "lo", "low", "start", "l"}
+            and params[2] in {"right", "hi", "high", "end", "r"}
+        ):
+            return [args, 0, len(args) - 1]
         if any(isinstance(arg, (list, dict)) for arg in args):
             return args
         return [args]
@@ -57,13 +70,21 @@ class AutoManimConverter:
         for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\{\s*\}|new\s+(?:Map|Set)\s*\()", code):
             object_vars.add(match.group(1))
 
+        table_vars = set()
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^\n;]*(?:Array\.from|new\s+Array|Array\s*\()[^\n;]*)", code):
+            initializer = match.group(2)
+            if "Array.from" in initializer or "new Array" in initializer or "Array(" in initializer:
+                table_vars.add(match.group(1))
+        for match in re.finditer(r"\b([A-Za-z_$][\w$]*)\s*\[[^\]]+\](?:\s*\[[^\]]+\])?\s*=", code):
+            table_vars.add(match.group(1))
+
         declared_vars = set()
         for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", code):
             declared_vars.add(match.group(1))
         for match in re.finditer(r"\bfor\s*\(\s*(?:let|var|const)\s+([A-Za-z_$][\w$]*)\s*=", code):
             declared_vars.add(match.group(1))
 
-        scalar_vars = sorted(declared_vars - array_vars - object_vars)
+        scalar_vars = sorted(declared_vars - array_vars - object_vars - table_vars)
         array_roles: Dict[str, str] = {}
         for name in sorted(array_vars):
             push_patterns = re.findall(rf"\b{re.escape(name)}\.push\(([^;\n]*)\)", code)
@@ -76,6 +97,7 @@ class AutoManimConverter:
             "array_roles": array_roles,
             "array_vars": sorted(array_vars),
             "object_vars": sorted(object_vars),
+            "table_vars": sorted(table_vars),
             "scalar_vars": scalar_vars,
         }
 
@@ -140,7 +162,7 @@ class AutoManimConverter:
         }}
 
         // Limit events pushed to trace to avoid unbounded growth
-        const MAX_TRACE = 500;
+        const MAX_TRACE = 12345678;
         function pushTrace(obj) {{
             if (executionTrace.length < MAX_TRACE) {{
                 executionTrace.push(obj);
@@ -202,6 +224,34 @@ class AutoManimConverter:
                 obj: name,
                 key: cloneValue(key),
                 value: cloneValue(value)
+            }});
+            return value;
+        }}
+
+        function traceTableInit(name, table) {{
+            pushTrace({{
+                step: stepCounter++,
+                type: 'table_init',
+                name,
+                value: cloneValue(table)
+            }});
+            return table;
+        }}
+
+        function traceTableSet(table, row, col, value, name = 'table') {{
+            if (col === null || col === undefined) {{
+                table[row] = value;
+            }} else {{
+                table[row][col] = value;
+            }}
+            pushTrace({{
+                step: stepCounter++,
+                type: 'table_set',
+                name,
+                row: cloneValue(row),
+                col: cloneValue(col),
+                value: cloneValue(value),
+                table: cloneValue(table)
             }});
             return value;
         }}
@@ -322,7 +372,7 @@ class AutoManimConverter:
             m = re.search(r"for\s*\(([^)]*)\)", original)
             trace_calls = ""
             if m:
-                init = m.group(1)
+                init = m.group(1).split(";")[0]
                 found = [v for v in vars_to_track if re.search(rf"\b{re.escape(v)}\b", init)]
                 if found:
                     trace_calls = "".join([f" traceAssign('{v}', {v});" for v in found])
@@ -334,6 +384,24 @@ class AutoManimConverter:
         for obj in self.variable_info.get("object_vars", []):
             instrumented = re.sub(rf"\b{obj}\s*\[\s*([^\]]+)\s*\]\s*=\s*([^;\n]+);",
                                   rf"tracePropSet({obj}, \1, \2, '{obj}');", instrumented)
+
+        for table in self.variable_info.get("table_vars", []):
+            instrumented = re.sub(
+                rf"\b{table}\s*\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*=\s*([^;\n]+);",
+                rf"traceTableSet({table}, \1, \2, \3, '{table}');",
+                instrumented,
+            )
+            instrumented = re.sub(
+                rf"\b{table}\s*\[\s*([^\]]+)\s*\]\s*=\s*([^;\n]+);",
+                rf"traceTableSet({table}, \1, null, \2, '{table}');",
+                instrumented,
+            )
+            instrumented = re.sub(
+                rf"(\b(?:const|let|var)\s+{table}\s*=\s*[^;\n]+;)",
+                rf"\1 traceTableInit('{table}', {table});",
+                instrumented,
+                count=1,
+            )
 
         # Instrument array mutations after arrays have been wrapped with names.
         array_vars = set(replacements.keys())
@@ -362,11 +430,19 @@ class AutoManimConverter:
             "index": 0,
             "call_stack": [],
             "decision_tree": [],
+            "call_tree": [],
+            "active_call_id": None,
+            "tables": {},
+            "active_table": None,
+            "active_cell": None,
             "locals": {}
         }
         local_scopes = []
+        call_node_stack = []
+        call_node_counter = 0
         array_vars = set(self.variable_info.get("array_vars", []))
         object_vars = set(self.variable_info.get("object_vars", []))
+        table_vars = set(self.variable_info.get("table_vars", []))
 
         for trace_item in self.trace.get("trace", []):
             if trace_item["type"] == "var_assign":
@@ -389,6 +465,36 @@ class AutoManimConverter:
                     current_state.setdefault("locals", {}).setdefault(obj, {})[str(key)] = val
                 steps.append({
                     "action": f"{obj}[{key}] = {val}",
+                    "state": self._copy_state(current_state)
+                })
+                continue
+
+            if trace_item["type"] == "table_init":
+                name = trace_item.get("name")
+                value = trace_item.get("value")
+                if name:
+                    current_state.setdefault("tables", {})[name] = value
+                    current_state.setdefault("locals", {})[name] = value
+                    current_state["active_table"] = name
+                    current_state["active_cell"] = None
+                steps.append({
+                    "action": f"Initialize table {name}",
+                    "state": self._copy_state(current_state)
+                })
+                continue
+
+            if trace_item["type"] == "table_set":
+                name = trace_item.get("name")
+                row = trace_item.get("row")
+                col = trace_item.get("col")
+                value = trace_item.get("value")
+                if name:
+                    current_state.setdefault("tables", {})[name] = trace_item.get("table")
+                    current_state.setdefault("locals", {})[name] = trace_item.get("table")
+                    current_state["active_table"] = name
+                    current_state["active_cell"] = [row] if col is None else [row, col]
+                steps.append({
+                    "action": f"{name}[{row}] = {value}" if col is None else f"{name}[{row}][{col}] = {value}",
                     "state": self._copy_state(current_state)
                 })
                 continue
@@ -456,12 +562,31 @@ class AutoManimConverter:
 
             elif trace_item["type"] == "function_entry":
                 local_scopes.append(self._copy_state(current_state.get("locals", {})))
-                current_state.setdefault("call_stack", []).append(trace_item.get("name"))
+                function_name = trace_item.get("name")
+                current_state.setdefault("call_stack", []).append(function_name)
                 params = trace_item.get("params") or []
                 args = trace_item.get("args") or []
                 for index, arg in enumerate(args):
                     name = params[index] if index < len(params) else f"arg{index}"
                     current_state.setdefault("locals", {})[name] = arg
+                    if name in table_vars and isinstance(arg, list):
+                        current_state.setdefault("tables", {})[name] = arg
+                        current_state["active_table"] = name
+                        current_state["active_cell"] = None
+                node_id = f"call-{call_node_counter}"
+                call_node_counter += 1
+                label_args = ", ".join(f"{params[index] if index < len(params) else f'arg{index}'}={arg}" for index, arg in enumerate(args[:3]))
+                if len(args) > 3:
+                    label_args += ", ..."
+                current_state.setdefault("call_tree", []).append({
+                    "id": node_id,
+                    "parent": call_node_stack[-1] if call_node_stack else "",
+                    "label": f"{function_name}({label_args})",
+                    "depth": len(call_node_stack),
+                    "status": "active",
+                })
+                call_node_stack.append(node_id)
+                current_state["active_call_id"] = node_id
                 steps.append({
                     "action": f"Call {trace_item['name']} with {trace_item['args']}",
                     "state": self._copy_state(current_state),
@@ -469,9 +594,16 @@ class AutoManimConverter:
                 })
 
             elif trace_item["type"] == "function_exit":
+                if call_node_stack:
+                    finished_id = call_node_stack.pop()
+                    for node in current_state.get("call_tree", []):
+                        if node.get("id") == finished_id:
+                            node["status"] = "done"
+                            break
+                    current_state["active_call_id"] = call_node_stack[-1] if call_node_stack else None
                 if local_scopes:
                     restored_locals = local_scopes.pop()
-                    for name in array_vars | object_vars:
+                    for name in array_vars | object_vars | table_vars:
                         if name in current_state.get("locals", {}):
                             restored_locals[name] = current_state["locals"][name]
                     current_state["locals"] = restored_locals
@@ -635,6 +767,43 @@ class AutoManimConverter:
       font-weight: 800;
       background: #f8fafc;
     }}
+    .table-wrap {{ display: inline-block; min-width: max-content; }}
+    .table-wrap.below-tree {{ display: block; margin-top: 22px; }}
+    .table-title {{ margin: 2px 0 10px; color: #17212f; font-weight: 800; }}
+    .dp-table {{ border-collapse: collapse; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }}
+    .dp-table th, .dp-table td {{
+      min-width: 42px;
+      height: 34px;
+      padding: 6px 8px;
+      border: 1px solid #cbd5e1;
+      text-align: center;
+      background: #fff;
+    }}
+    .dp-table th {{ background: #f1f5f9; color: #475569; font-weight: 800; }}
+    .dp-table td.active-cell {{
+      background: #fef08a;
+      border-color: #eab308;
+      box-shadow: inset 0 0 0 2px #facc15;
+      font-weight: 850;
+    }}
+    .call-node {{
+      max-width: 190px;
+      padding: 7px 9px;
+      border: 2px solid #94a3b8;
+      border-radius: 8px;
+      background: #fff;
+      color: #17212f;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      font-weight: 750;
+      overflow-wrap: anywhere;
+      text-align: center;
+    }}
+    .call-node.active {{
+      border-color: #facc15;
+      box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.25);
+    }}
+    .call-node.done {{ border-color: #22c55e; }}
     .result-box {{ min-height: 56px; padding: 10px 14px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }}
     @media (max-width: 860px) {{
       .topbar, .content {{ grid-template-columns: 1fr; }}
@@ -658,7 +827,7 @@ class AutoManimConverter:
         <div id="statePanel"></div>
       </aside>
       <section class="tree-panel">
-        <h2>Decision Tree</h2>
+        <h2 id="visualTitle">Decision Tree</h2>
         <div id="treePanel"></div>
       </section>
     </section>
@@ -767,6 +936,106 @@ class AutoManimConverter:
       }}
     }}
 
+    function isMatrix(value) {{
+      return Array.isArray(value) && value.length > 0 && value.every((row) => Array.isArray(row));
+    }}
+
+    function normalizeTable(value) {{
+      if (!Array.isArray(value)) return null;
+      if (isMatrix(value)) return value;
+      return [value];
+    }}
+
+    function renderTablePanel(state, belowTree = false) {{
+      const treePanel = document.getElementById("treePanel");
+      const previous = treePanel.querySelector(".tree-lines");
+      previous?.remove();
+      const tables = state.tables || {{}};
+      const tableName = state.active_table || Object.keys(tables).find((name) => normalizeTable(tables[name]));
+      const table = tableName ? tables[tableName] : null;
+      const rows = normalizeTable(table);
+      if (!rows) return false;
+
+      const wrap = document.createElement("div");
+      wrap.className = "table-wrap" + (belowTree ? " below-tree" : "");
+      const title = document.createElement("div");
+      title.className = "table-title";
+      title.textContent = `${{tableName}} table`;
+      const grid = document.createElement("table");
+      grid.className = "dp-table";
+
+      const colCount = Math.max(...rows.map((row) => row.length), 0);
+      const head = document.createElement("tr");
+      head.append(document.createElement("th"));
+      for (let col = 0; col < colCount; col += 1) {{
+        const th = document.createElement("th");
+        th.textContent = String(col);
+        head.append(th);
+      }}
+      grid.append(head);
+
+      const activeCell = state.active_cell || [];
+      const activeRow = activeCell.length === 1 ? 0 : activeCell[0];
+      const activeCol = activeCell.length === 1 ? activeCell[0] : activeCell[1];
+      rows.forEach((row, rowIndex) => {{
+        const tr = document.createElement("tr");
+        const th = document.createElement("th");
+        th.textContent = String(rowIndex);
+        tr.append(th);
+        for (let col = 0; col < colCount; col += 1) {{
+          const td = document.createElement("td");
+          td.textContent = row[col] === undefined ? "" : String(row[col]);
+          if (activeRow === rowIndex && activeCol === col) td.classList.add("active-cell");
+          tr.append(td);
+        }}
+        grid.append(tr);
+      }});
+
+      wrap.append(title, grid);
+      treePanel.append(wrap);
+      return true;
+    }}
+
+    function renderCallTreePanel(state) {{
+      const treePanel = document.getElementById("treePanel");
+      const calls = state.call_tree || [];
+      if (!calls.length) return false;
+
+      const nodesByDepth = new Map();
+      calls.forEach((node) => {{
+        if (!nodesByDepth.has(node.depth)) nodesByDepth.set(node.depth, []);
+        nodesByDepth.get(node.depth).push(node);
+      }});
+
+      const maxDepth = Math.max(...nodesByDepth.keys());
+      for (let depth = 0; depth <= maxDepth; depth += 1) {{
+        const row = document.createElement("div");
+        row.className = "tree-row";
+        if (depth === 0) row.classList.add("root-row");
+        row.style.margin = "28px 0";
+        const label = document.createElement("div");
+        label.className = "row-label";
+        label.textContent = depth === 0 ? "root" : `depth ${{depth}}`;
+        const nodes = document.createElement("div");
+        nodes.className = "nodes";
+        (nodesByDepth.get(depth) || []).forEach((item) => {{
+          const wrap = document.createElement("div");
+          wrap.className = "node-wrap";
+          wrap.dataset.nodeKey = item.id;
+          if (item.parent) wrap.dataset.parentKey = item.parent;
+          const node = document.createElement("div");
+          node.className = "call-node" + (item.id === state.active_call_id ? " active" : "") + (item.status === "done" ? " done" : "");
+          node.textContent = item.label;
+          wrap.append(node);
+          nodes.append(wrap);
+        }});
+        row.append(label, nodes);
+        treePanel.append(row);
+      }}
+      requestAnimationFrame(drawConnectors);
+      return true;
+    }}
+
     function render() {{
       const step = data.steps[currentStep] || {{ action: "Start", state: {{ subset: [], result: [], decision_tree: [] }} }};
       const state = step.state;
@@ -783,6 +1052,21 @@ class AutoManimConverter:
       treePanel.innerHTML = "";
       valueColorMap.clear();
       (choicesData || []).forEach(colorForValue);
+
+      if (!decisions.length && renderCallTreePanel(state)) {{
+        renderTablePanel(state, true);
+        document.getElementById("visualTitle").textContent = "Decision Tree";
+        document.getElementById("prevButton").disabled = currentStep === 0;
+        document.getElementById("nextButton").disabled = currentStep >= data.steps.length - 1;
+        return;
+      }}
+      if (renderTablePanel(state)) {{
+        document.getElementById("visualTitle").textContent = "DP Table";
+        document.getElementById("prevButton").disabled = currentStep === 0;
+        document.getElementById("nextButton").disabled = currentStep >= data.steps.length - 1;
+        return;
+      }}
+      document.getElementById("visualTitle").textContent = "Decision Tree";
 
       const summary = document.createElement("div");
       summary.className = "summary-row";
@@ -994,6 +1278,144 @@ class AutoManimConverter:
 
                 return diagram
 
+            def normalize_table(self, table):
+                if not isinstance(table, list):
+                    return None
+                if table and all(isinstance(row, list) for row in table):
+                    return table
+                return [table]
+
+            def render_table(self, step):
+                state = step["state"]
+                tables = state.get("tables", {})
+                table_name = state.get("active_table")
+                if not table_name:
+                    for name, value in tables.items():
+                        if self.normalize_table(value):
+                            table_name = name
+                            break
+                table = self.normalize_table(tables.get(table_name)) if table_name else None
+                if not table:
+                    return self.render_decision_tree(step)
+
+                max_rows = min(len(table), 8)
+                max_cols = min(max((len(row) for row in table), default=0), 10)
+                active_cell = state.get("active_cell") or []
+                active_row = 0 if len(active_cell) == 1 else active_cell[0] if active_cell else None
+                active_col = active_cell[0] if len(active_cell) == 1 else active_cell[1] if len(active_cell) > 1 else None
+
+                diagram = VGroup()
+                title = self.fitted_text(f"{table_name} table", font_size=18, color=WHITE, max_width=2.4)
+                diagram.add(title)
+
+                grid = VGroup()
+                cell_w = 0.58
+                cell_h = 0.42
+                header_color = DARK_GRAY
+                for row_index in range(max_rows + 1):
+                    for col_index in range(max_cols + 1):
+                        x = (col_index - max_cols / 2) * cell_w
+                        y = ((max_rows / 2) - row_index) * cell_h
+                        is_header = row_index == 0 or col_index == 0
+                        data_row = row_index - 1
+                        data_col = col_index - 1
+                        is_active = data_row == active_row and data_col == active_col
+                        rect = Rectangle(
+                            width=cell_w,
+                            height=cell_h,
+                            color=YELLOW if is_active else GRAY,
+                            stroke_width=3 if is_active else 1,
+                            fill_color=YELLOW if is_active else header_color if is_header else BLACK,
+                            fill_opacity=0.35 if is_active else 0.35 if is_header else 0,
+                        )
+                        rect.move_to(RIGHT * x + UP * y)
+                        label_text = ""
+                        if row_index == 0 and col_index > 0:
+                            label_text = str(data_col)
+                        elif col_index == 0 and row_index > 0:
+                            label_text = str(data_row)
+                        elif row_index > 0 and col_index > 0:
+                            row = table[data_row] if data_row < len(table) else []
+                            label_text = "" if data_col >= len(row) else str(row[data_col])
+                        cell = VGroup(rect)
+                        if label_text != "":
+                            color = BLACK if is_active else WHITE
+                            label = self.fitted_text(label_text, font_size=13, color=color, max_width=cell_w - 0.1)
+                            label.move_to(rect.get_center())
+                            cell.add(label)
+                        grid.add(cell)
+
+                grid.next_to(title, DOWN, buff=0.25)
+                diagram.add(grid)
+                return diagram
+
+            def render_call_tree(self, step):
+                state = step["state"]
+                calls = state.get("call_tree", [])
+                if not calls:
+                    return self.render_decision_tree(step)
+
+                diagram = VGroup()
+                rows = {}
+                for node in calls:
+                    rows.setdefault(node.get("depth", 0), []).append(node)
+
+                positioned = {}
+                max_depth = min(max(rows.keys(), default=0), 5)
+                y_top = 1.55
+                y_gap = 0.72
+                for depth in range(0, max_depth + 1):
+                    depth_nodes = rows.get(depth, [])[:6]
+                    if not depth_nodes:
+                        continue
+                    y = y_top - depth * y_gap
+                    row_label = self.fitted_text("root" if depth == 0 else f"depth {depth}", font_size=11, color=GRAY, max_width=0.9)
+                    row_label.move_to(LEFT * 3.35 + UP * y)
+                    diagram.add(row_label)
+                    count = len(depth_nodes)
+                    for index, node in enumerate(depth_nodes):
+                        x = 0 if count == 1 else -2.45 + 4.9 * index / max(1, count - 1)
+                        is_active = node.get("id") == state.get("active_call_id")
+                        is_done = node.get("status") == "done"
+                        color = YELLOW if is_active else GREEN if is_done else GRAY
+                        rect = RoundedRectangle(
+                            width=1.28,
+                            height=0.42,
+                            corner_radius=0.07,
+                            color=color,
+                            stroke_width=3 if is_active else 1.6,
+                            fill_color=BLACK,
+                            fill_opacity=0.08,
+                        )
+                        rect.move_to(RIGHT * x + UP * y)
+                        label = self.fitted_text(node.get("label", ""), font_size=10, color=WHITE, max_width=1.14)
+                        label.move_to(rect.get_center())
+                        rendered = VGroup(rect, label)
+                        positioned[node.get("id")] = rendered
+                        diagram.add(rendered)
+
+                for node in calls:
+                    child = positioned.get(node.get("id"))
+                    parent = positioned.get(node.get("parent"))
+                    if child and parent:
+                        diagram.add(Line(parent.get_bottom(), child.get_top(), color=GRAY, stroke_width=1.5).set_z_index(-1))
+
+                return diagram
+
+            def render_center_visual(self, step):
+                state = step["state"]
+                if state.get("call_tree") and not state.get("decision_tree"):
+                    call_tree = self.render_call_tree(step)
+                    if state.get("tables"):
+                        table = self.render_table(step)
+                        table.scale(0.72)
+                        group = VGroup(call_tree, table).arrange(DOWN, buff=0.28)
+                        return group
+                    return call_tree
+                if state.get("tables"):
+                    return self.render_table(step)
+                return self.render_decision_tree(step)
+
             def render_array_node(self, values, slot_count, scale=0.5, highlight=False, active_kind=None, stroke_color=BLUE, color_mode=None):
                 cells = VGroup()
                 for index in range(slot_count):
@@ -1053,7 +1475,8 @@ class AutoManimConverter:
 
                 tree_box = Rectangle(height=4.45, width=8.45, color=WHITE)
                 tree_box.move_to(RIGHT * 2.15 + DOWN * 0.05)
-                tree_label = Text("Decision Tree", font_size=20, color=GREEN)
+                has_table_visual = any(step.get("state", {}).get("tables") for step in animation_steps)
+                tree_label = Text("DP Table" if has_table_visual else "Decision Tree", font_size=20, color=GREEN)
                 tree_label.move_to(tree_box.get_top() + DOWN * 0.3)
                 self.play(Create(tree_box), Write(tree_label))
 
@@ -1091,7 +1514,7 @@ class AutoManimConverter:
                     if new_state_content.height > state_box.height - 0.65:
                         new_state_content.scale_to_fit_height(state_box.height - 0.65)
                     new_state_content.move_to(state_box.get_center())
-                    new_tree_content = self.render_decision_tree(step)
+                    new_tree_content = self.render_center_visual(step)
                     if new_tree_content.width > tree_box.width - 0.35:
                         new_tree_content.scale_to_fit_width(tree_box.width - 0.35)
                     if new_tree_content.height > tree_box.height - 0.7:
@@ -1135,39 +1558,39 @@ class AutoManimConverter:
 if __name__ == "__main__":
     # Your LeetCode 90 JavaScript code
     js_code = """
-function  solution(s) {
-    const n = s.length;
-    if (n === 0) return "";
+    function solution(coins, amount) {
+// dp[i] stores the minimum number of coins to reach amount i
+    const dp = Array(amount + 1).fill(Infinity);
+    // lastCoin[i] stores the coin value used to reach amount i
+    const lastCoin = Array(amount + 1).fill(-1);
     
-    let start = 0, maxLength = 1;
-    const dp = Array.from({ length: n }, () => Array(n).fill(false));
-    
-    for (let i = 0; i < n; i++) {
-        dp[i][i] = true; // Single chars are palindromes
-    }
-    
-    for (let length = 2; length <= n; length++) {
-        for (let i = 0; i <= n - length; i++) {
-            const j = i + length - 1;
-            if (s[i] === s[j]) {
-                if (length === 2) {
-                    dp[i][j] = true;
-                } else {
-                    dp[i][j] = dp[i + 1][j - 1];
-                }
-                if (dp[i][j] && length > maxLength) {
-                    start = i;
-                    maxLength = length;
-                }
+    dp[0] = 0;
+
+    for (let i = 1; i <= amount; i++) {
+        for (const coin of coins) {
+            if (i - coin >= 0 && dp[i - coin] + 1 < dp[i]) {
+                dp[i] = dp[i - coin] + 1;
+                lastCoin[i] = coin; // Track the coin used for this amount
             }
         }
     }
-    
-    return s.substring(start, start + maxLength);
-}
+
+    // If amount is unreachable, return -1
+    //if (dp[amount] === Infinity) return -1;
+
+    // Reconstruct the combination by backtracking
+    const combination = [];
+    let current = amount;
+    while (current > 0) {
+        combination.push(lastCoin[current]);
+        current -= lastCoin[current];
+    }
+
+    return combination;
+    }
     """
 
     # Args map to subsetSumINaive(nums, target).
-    converter = AutoManimConverter(js_code, "solution", "babad")
-    viewer = converter.generate_interactive_viewer("5_longest_palindromic_substring")
+    converter = AutoManimConverter(js_code, "solution", [[1,2,5],13])
+    viewer = converter.generate_interactive_viewer("coinchange_combination")
     print(f"Interactive viewer: {viewer}")
