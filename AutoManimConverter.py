@@ -6,6 +6,15 @@ import subprocess
 import re
 from typing import Any, Dict, List
 
+try:
+    from manim_dsa import MTree
+    from manim_dsa.constants import MTreeStyle
+    HAS_MANIM_DSA = True
+except ImportError:
+    MTree = None
+    MTreeStyle = None
+    HAS_MANIM_DSA = False
+
 class AutoManimConverter:
     def __init__(self, js_code: str, function_name: str, args: list, leetcode_id: int | str | None = None):
         self.js_code = js_code
@@ -67,8 +76,14 @@ class AutoManimConverter:
             array_vars.add(match.group(1))
 
         object_vars = set()
+        set_vars = set()
+        map_vars = set()
         for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\{\s*\}|new\s+(?:Map|Set)\s*\()", code):
             object_vars.add(match.group(1))
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+Set\s*\(", code):
+            set_vars.add(match.group(1))
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+Map\s*\(", code):
+            map_vars.add(match.group(1))
 
         table_vars = set()
         for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^\n;]*(?:Array\.from|new\s+Array|Array\s*\()[^\n;]*)", code):
@@ -86,17 +101,27 @@ class AutoManimConverter:
 
         scalar_vars = sorted(declared_vars - array_vars - object_vars - table_vars)
         array_roles: Dict[str, str] = {}
+        stack_vars = set()
         for name in sorted(array_vars):
             push_patterns = re.findall(rf"\b{re.escape(name)}\.push\(([^;\n]*)\)", code)
             has_pop = re.search(rf"\b{re.escape(name)}\.pop\(\)", code) is not None
             saves_copy = any(arg.strip().startswith("[") or arg.strip().startswith("Array.from(") for arg in push_patterns)
-            array_roles[name] = "result" if saves_copy and not has_pop else "subset" if has_pop else name
+            if saves_copy and not has_pop:
+                array_roles[name] = "result"
+            elif has_pop:
+                array_roles[name] = "stack"
+                stack_vars.add(name)
+            else:
+                array_roles[name] = name
 
         return {
             "functions": functions,
             "array_roles": array_roles,
             "array_vars": sorted(array_vars),
             "object_vars": sorted(object_vars),
+            "set_vars": sorted(set_vars),
+            "map_vars": sorted(map_vars),
+            "stack_vars": sorted(stack_vars),
             "table_vars": sorted(table_vars),
             "scalar_vars": scalar_vars,
         }
@@ -172,13 +197,42 @@ class AutoManimConverter:
         // Trace scalar variable assignments (minimal helper)
         function traceAssign(name, value) {{
             const v = value;
+            const tree = serializeBinaryTree(v);
             pushTrace({{
                 step: stepCounter++,
                 type: 'var_assign',
                 name,
-                value: cloneValue(v)
+                value: cloneValue(v),
+                binaryTree: tree
             }});
             return v;
+        }}
+
+        function isTreeNode(value) {{
+            return value && typeof value === 'object' && 'val' in value && 'left' in value && 'right' in value;
+        }}
+
+        function serializeBinaryTree(root) {{
+            if (!isTreeNode(root)) return null;
+            const adjacency = {{}};
+            const labels = {{}};
+            const seen = new WeakMap();
+            let counter = 0;
+            function visit(node) {{
+                if (!isTreeNode(node)) return null;
+                if (seen.has(node)) return seen.get(node);
+                const id = `node-${{counter++}}`;
+                seen.set(node, id);
+                labels[id] = cloneValue(node.val);
+                adjacency[id] = [];
+                const leftId = visit(node.left);
+                const rightId = visit(node.right);
+                if (leftId !== null) adjacency[id].push(leftId);
+                if (rightId !== null) adjacency[id].push(rightId);
+                return id;
+            }}
+            const rootId = visit(root);
+            return {{ root: rootId, adjacency, labels }};
         }}
 
         function arrayNameFor(array, fallbackName = 'array') {{
@@ -228,6 +282,82 @@ class AutoManimConverter:
             return value;
         }}
 
+        function collectionValue(collection) {{
+            if (collection instanceof Map) return Array.from(collection.entries());
+            if (collection instanceof Set) return Array.from(collection.values());
+            return cloneValue(collection);
+        }}
+
+        function traceCollectionInit(name, collection, kind) {{
+            pushTrace({{
+                step: stepCounter++,
+                type: 'collection_init',
+                name,
+                kind,
+                value: collectionValue(collection)
+            }});
+            return collection;
+        }}
+
+        function traceSetAdd(collection, value, name = 'set') {{
+            collection.add(value);
+            pushTrace({{
+                step: stepCounter++,
+                type: 'collection_set',
+                name,
+                kind: 'set',
+                op: 'add',
+                key: cloneValue(value),
+                value: collectionValue(collection)
+            }});
+            return collection;
+        }}
+
+        function traceSetDelete(collection, value, name = 'set') {{
+            const result = collection.delete(value);
+            pushTrace({{
+                step: stepCounter++,
+                type: 'collection_set',
+                name,
+                kind: 'set',
+                op: 'delete',
+                key: cloneValue(value),
+                result: cloneValue(result),
+                value: collectionValue(collection)
+            }});
+            return result;
+        }}
+
+        function traceMapSet(collection, key, value, name = 'map') {{
+            collection.set(key, value);
+            pushTrace({{
+                step: stepCounter++,
+                type: 'collection_set',
+                name,
+                kind: 'map',
+                op: 'set',
+                key: cloneValue(key),
+                itemValue: cloneValue(value),
+                value: collectionValue(collection)
+            }});
+            return collection;
+        }}
+
+        function traceMapDelete(collection, key, name = 'map') {{
+            const result = collection.delete(key);
+            pushTrace({{
+                step: stepCounter++,
+                type: 'collection_set',
+                name,
+                kind: 'map',
+                op: 'delete',
+                key: cloneValue(key),
+                result: cloneValue(result),
+                value: collectionValue(collection)
+            }});
+            return result;
+        }}
+
         function traceTableInit(name, table) {{
             pushTrace({{
                 step: stepCounter++,
@@ -270,6 +400,7 @@ class AutoManimConverter:
                     name,
                     params: functionParamsByName[name] || [],
                     args: cloneValue(args),
+                    binaryTrees: args.map((arg) => serializeBinaryTree(arg)),
                     depth: recursionDepth
                 }});
 
@@ -385,6 +516,42 @@ class AutoManimConverter:
             instrumented = re.sub(rf"\b{obj}\s*\[\s*([^\]]+)\s*\]\s*=\s*([^;\n]+);",
                                   rf"tracePropSet({obj}, \1, \2, '{obj}');", instrumented)
 
+        for name in self.variable_info.get("set_vars", []):
+            instrumented = re.sub(
+                rf"(\b(?:const|let|var)\s+{name}\s*=\s*new\s+Set\s*\([^;\n]*\);)",
+                rf"\1 traceCollectionInit('{name}', {name}, 'set');",
+                instrumented,
+                count=1,
+            )
+            instrumented = re.sub(
+                rf"\b{name}\.add\(([^;\n]+)\);",
+                rf"traceSetAdd({name}, \1, '{name}');",
+                instrumented,
+            )
+            instrumented = re.sub(
+                rf"\b{name}\.delete\(([^;\n]+)\);",
+                rf"traceSetDelete({name}, \1, '{name}');",
+                instrumented,
+            )
+
+        for name in self.variable_info.get("map_vars", []):
+            instrumented = re.sub(
+                rf"(\b(?:const|let|var)\s+{name}\s*=\s*new\s+Map\s*\([^;\n]*\);)",
+                rf"\1 traceCollectionInit('{name}', {name}, 'map');",
+                instrumented,
+                count=1,
+            )
+            instrumented = re.sub(
+                rf"\b{name}\.set\(([^,\n]+),\s*([^;\n]+)\);",
+                rf"traceMapSet({name}, \1, \2, '{name}');",
+                instrumented,
+            )
+            instrumented = re.sub(
+                rf"\b{name}\.delete\(([^;\n]+)\);",
+                rf"traceMapDelete({name}, \1, '{name}');",
+                instrumented,
+            )
+
         for table in self.variable_info.get("table_vars", []):
             instrumented = re.sub(
                 rf"\b{table}\s*\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*=\s*([^;\n]+);",
@@ -435,6 +602,10 @@ class AutoManimConverter:
             "tables": {},
             "active_table": None,
             "active_cell": None,
+            "collections": {},
+            "active_collection": None,
+            "binary_trees": {},
+            "active_binary_tree": None,
             "locals": {}
         }
         local_scopes = []
@@ -443,6 +614,7 @@ class AutoManimConverter:
         array_vars = set(self.variable_info.get("array_vars", []))
         object_vars = set(self.variable_info.get("object_vars", []))
         table_vars = set(self.variable_info.get("table_vars", []))
+        collection_vars = set(self.variable_info.get("stack_vars", [])) | set(self.variable_info.get("set_vars", [])) | set(self.variable_info.get("map_vars", []))
 
         for trace_item in self.trace.get("trace", []):
             if trace_item["type"] == "var_assign":
@@ -451,6 +623,9 @@ class AutoManimConverter:
                 # record local
                 if name:
                     current_state.setdefault("locals", {})[name] = val
+                    if trace_item.get("binaryTree"):
+                        current_state.setdefault("binary_trees", {})[name] = trace_item["binaryTree"]
+                        current_state["active_binary_tree"] = name
                 steps.append({
                     "action": f"{name} = {val}",
                     "state": self._copy_state(current_state)
@@ -499,12 +674,48 @@ class AutoManimConverter:
                 })
                 continue
 
+            if trace_item["type"] == "collection_init":
+                name = trace_item.get("name")
+                kind = trace_item.get("kind")
+                value = trace_item.get("value")
+                if name:
+                    current_state.setdefault("collections", {})[name] = {"kind": kind, "value": value}
+                    current_state.setdefault("locals", {})[name] = value
+                    current_state["active_collection"] = name
+                steps.append({
+                    "action": f"Initialize {kind} {name}",
+                    "state": self._copy_state(current_state)
+                })
+                continue
+
+            if trace_item["type"] == "collection_set":
+                name = trace_item.get("name")
+                kind = trace_item.get("kind")
+                op = trace_item.get("op")
+                value = trace_item.get("value")
+                if name:
+                    current_state.setdefault("collections", {})[name] = {"kind": kind, "value": value}
+                    current_state.setdefault("locals", {})[name] = value
+                    current_state["active_collection"] = name
+                steps.append({
+                    "action": f"{name}.{op}({trace_item.get('key')})",
+                    "state": self._copy_state(current_state)
+                })
+                continue
+
             if trace_item["type"] == "array_push":
                 array_name = self._classify_array_event(trace_item)
                 variable_name = trace_item.get("variableName")
                 if variable_name:
                     current_state.setdefault("locals", {})[variable_name] = trace_item.get("after")
-                if array_name == "subset":
+                if array_name == "stack":
+                    current_state.setdefault("collections", {})[variable_name] = {"kind": "stack", "value": trace_item.get("after")}
+                    current_state["active_collection"] = variable_name
+                    steps.append({
+                        "action": f"{variable_name}.push({trace_item.get('items')})",
+                        "state": self._copy_state(current_state)
+                    })
+                elif array_name == "subset":
                     current_state["subset"] = trace_item["after"]
                     item = trace_item["items"][0] if trace_item.get("items") else None
                     current_state["decision_tree"].append({
@@ -541,7 +752,14 @@ class AutoManimConverter:
                 variable_name = trace_item.get("variableName")
                 if variable_name:
                     current_state.setdefault("locals", {})[variable_name] = trace_item.get("after")
-                if array_name == "subset":
+                if array_name == "stack":
+                    current_state.setdefault("collections", {})[variable_name] = {"kind": "stack", "value": trace_item.get("after")}
+                    current_state["active_collection"] = variable_name
+                    steps.append({
+                        "action": f"{variable_name}.pop() -> {trace_item.get('item')}",
+                        "state": self._copy_state(current_state)
+                    })
+                elif array_name == "subset":
                     item = trace_item.get("item")
                     current_state["subset"] = trace_item["after"]
                     current_state["decision_tree"].append({
@@ -569,6 +787,10 @@ class AutoManimConverter:
                 for index, arg in enumerate(args):
                     name = params[index] if index < len(params) else f"arg{index}"
                     current_state.setdefault("locals", {})[name] = arg
+                    binary_trees = trace_item.get("binaryTrees") or []
+                    if index < len(binary_trees) and binary_trees[index]:
+                        current_state.setdefault("binary_trees", {})[name] = binary_trees[index]
+                        current_state["active_binary_tree"] = name
                     if name in table_vars and isinstance(arg, list):
                         current_state.setdefault("tables", {})[name] = arg
                         current_state["active_table"] = name
@@ -603,7 +825,7 @@ class AutoManimConverter:
                     current_state["active_call_id"] = call_node_stack[-1] if call_node_stack else None
                 if local_scopes:
                     restored_locals = local_scopes.pop()
-                    for name in array_vars | object_vars | table_vars:
+                    for name in array_vars | object_vars | table_vars | collection_vars:
                         if name in current_state.get("locals", {}):
                             restored_locals[name] = current_state["locals"][name]
                     current_state["locals"] = restored_locals
@@ -770,6 +992,45 @@ class AutoManimConverter:
     .table-wrap {{ display: inline-block; min-width: max-content; }}
     .table-wrap.below-tree {{ display: block; margin-top: 22px; }}
     .table-title {{ margin: 2px 0 10px; color: #17212f; font-weight: 800; }}
+    .collection-wrap, .binary-tree-wrap {{
+      display: block;
+      min-width: max-content;
+      margin-top: 22px;
+      position: relative;
+      z-index: 1;
+    }}
+    .collection-title, .binary-tree-title {{
+      margin: 2px 0 10px;
+      color: #17212f;
+      font-weight: 800;
+    }}
+    .collection-body {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      max-width: 760px;
+    }}
+    .collection-chip, .map-entry {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 6px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #f8fafc;
+      color: #17212f;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      font-weight: 750;
+    }}
+    .collection-chip.active {{
+      background: #fef08a;
+      border-color: #eab308;
+      box-shadow: inset 0 0 0 2px #facc15;
+    }}
+    .map-entry {{ gap: 8px; }}
+    .map-arrow {{ color: #64748b; font-weight: 800; }}
     .dp-table {{ border-collapse: collapse; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }}
     .dp-table th, .dp-table td {{
       min-width: 42px;
@@ -804,6 +1065,22 @@ class AutoManimConverter:
       box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.25);
     }}
     .call-node.done {{ border-color: #22c55e; }}
+    .binary-node {{
+      width: 38px;
+      height: 38px;
+      display: inline-grid;
+      place-items: center;
+      border: 2px solid #94a3b8;
+      border-radius: 50%;
+      background: #fff;
+      color: #17212f;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      font-weight: 850;
+    }}
+    .binary-tree-wrap .tree-row {{ grid-template-columns: 74px minmax(0, 1fr); }}
+    .binary-tree-wrap .nodes {{ gap: 34px; }}
+    .binary-tree-wrap .node-wrap {{ min-width: 64px; }}
     .result-box {{ min-height: 56px; padding: 10px 14px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }}
     @media (max-width: 860px) {{
       .topbar, .content {{ grid-template-columns: 1fr; }}
@@ -996,6 +1273,125 @@ class AutoManimConverter:
       return true;
     }}
 
+    function displayValue(value) {{
+      if (value === null) return "null";
+      if (value === undefined) return "";
+      if (typeof value === "string") return value;
+      return JSON.stringify(value);
+    }}
+
+    function renderCollectionPanel(state, belowTree = false) {{
+      const treePanel = document.getElementById("treePanel");
+      const collections = state.collections || {{}};
+      const collectionName = state.active_collection || Object.keys(collections)[0];
+      const item = collectionName ? collections[collectionName] : null;
+      if (!item) return false;
+
+      const kind = item.kind || "collection";
+      const values = Array.isArray(item.value) ? item.value : [];
+      const wrap = document.createElement("div");
+      wrap.className = "collection-wrap" + (belowTree ? " below-tree" : "");
+      const title = document.createElement("div");
+      title.className = "collection-title";
+      title.textContent = `${{collectionName}} ${{kind}}`;
+      const body = document.createElement("div");
+      body.className = "collection-body";
+
+      if (!values.length) {{
+        const empty = document.createElement("span");
+        empty.className = "collection-chip";
+        empty.textContent = "empty";
+        body.append(empty);
+      }} else if (kind === "map") {{
+        values.forEach((entry) => {{
+          const row = document.createElement("span");
+          row.className = "map-entry";
+          const key = document.createElement("span");
+          key.textContent = displayValue(entry?.[0]);
+          const arrow = document.createElement("span");
+          arrow.className = "map-arrow";
+          arrow.textContent = "=>";
+          const value = document.createElement("span");
+          value.textContent = displayValue(entry?.[1]);
+          row.append(key, arrow, value);
+          body.append(row);
+        }});
+      }} else {{
+        values.forEach((value, index) => {{
+          const chip = document.createElement("span");
+          chip.className = "collection-chip" + (kind === "stack" && index === values.length - 1 ? " active" : "");
+          chip.textContent = displayValue(value);
+          body.append(chip);
+        }});
+      }}
+
+      wrap.append(title, body);
+      treePanel.append(wrap);
+      return true;
+    }}
+
+    function renderBinaryTreePanel(state, belowTree = false) {{
+      const treePanel = document.getElementById("treePanel");
+      const trees = state.binary_trees || {{}};
+      const treeName = state.active_binary_tree || Object.keys(trees)[0];
+      const tree = treeName ? trees[treeName] : null;
+      if (!tree || !tree.root || !tree.labels) return false;
+
+      const adjacency = tree.adjacency || {{}};
+      const labels = tree.labels || {{}};
+      const rows = new Map();
+      const queue = [{{ id: tree.root, depth: 0, parent: "" }}];
+      const seen = new Set();
+      while (queue.length) {{
+        const current = queue.shift();
+        if (!current || seen.has(current.id)) continue;
+        seen.add(current.id);
+        if (!rows.has(current.depth)) rows.set(current.depth, []);
+        rows.get(current.depth).push(current);
+        (adjacency[current.id] || []).forEach((childId) => {{
+          queue.push({{ id: childId, depth: current.depth + 1, parent: current.id }});
+        }});
+      }}
+      if (!rows.size) return false;
+
+      const wrap = document.createElement("div");
+      wrap.className = "binary-tree-wrap" + (belowTree ? " below-tree" : "");
+      const title = document.createElement("div");
+      title.className = "binary-tree-title";
+      title.textContent = `${{treeName}} TreeNode`;
+      wrap.append(title);
+
+      const maxDepth = Math.max(...rows.keys());
+      for (let depth = 0; depth <= maxDepth; depth += 1) {{
+        const row = document.createElement("div");
+        row.className = "tree-row";
+        if (depth === 0) row.classList.add("root-row");
+        row.style.margin = "22px 0";
+        const label = document.createElement("div");
+        label.className = "row-label";
+        label.textContent = depth === 0 ? "root" : `depth ${{depth}}`;
+        const nodes = document.createElement("div");
+        nodes.className = "nodes";
+        (rows.get(depth) || []).forEach((item) => {{
+          const nodeWrap = document.createElement("div");
+          nodeWrap.className = "node-wrap";
+          nodeWrap.dataset.nodeKey = `binary:${{item.id}}`;
+          if (item.parent) nodeWrap.dataset.parentKey = `binary:${{item.parent}}`;
+          const node = document.createElement("div");
+          node.className = "binary-node";
+          node.textContent = displayValue(labels[item.id]);
+          nodeWrap.append(node);
+          nodes.append(nodeWrap);
+        }});
+        row.append(label, nodes);
+        wrap.append(row);
+      }}
+
+      treePanel.append(wrap);
+      requestAnimationFrame(drawConnectors);
+      return true;
+    }}
+
     function renderCallTreePanel(state) {{
       const treePanel = document.getElementById("treePanel");
       const calls = state.call_tree || [];
@@ -1054,8 +1450,25 @@ class AutoManimConverter:
       (choicesData || []).forEach(colorForValue);
 
       if (!decisions.length && renderCallTreePanel(state)) {{
+        renderBinaryTreePanel(state, true);
+        renderCollectionPanel(state, true);
         renderTablePanel(state, true);
         document.getElementById("visualTitle").textContent = "Decision Tree";
+        document.getElementById("prevButton").disabled = currentStep === 0;
+        document.getElementById("nextButton").disabled = currentStep >= data.steps.length - 1;
+        return;
+      }}
+      if (renderBinaryTreePanel(state)) {{
+        renderCollectionPanel(state, true);
+        renderTablePanel(state, true);
+        document.getElementById("visualTitle").textContent = "Binary Tree";
+        document.getElementById("prevButton").disabled = currentStep === 0;
+        document.getElementById("nextButton").disabled = currentStep >= data.steps.length - 1;
+        return;
+      }}
+      if (renderCollectionPanel(state)) {{
+        renderTablePanel(state, true);
+        document.getElementById("visualTitle").textContent = "Collection";
         document.getElementById("prevButton").disabled = currentStep === 0;
         document.getElementById("nextButton").disabled = currentStep >= data.steps.length - 1;
         return;
@@ -1349,6 +1762,136 @@ class AutoManimConverter:
                 diagram.add(grid)
                 return diagram
 
+            def render_collection(self, step):
+                state = step["state"]
+                collections = state.get("collections", {})
+                name = state.get("active_collection")
+                if not name and collections:
+                    name = next(iter(collections))
+                item = collections.get(name) if name else None
+                if not item:
+                    return self.render_decision_tree(step)
+
+                kind = item.get("kind")
+                value = item.get("value") or []
+                diagram = VGroup()
+                title = self.fitted_text(f"{name} {kind}", font_size=18, color=WHITE, max_width=2.6)
+                diagram.add(title)
+
+                body = VGroup()
+                if kind == "map":
+                    rows = value[:8] if isinstance(value, list) else []
+                    for key, val in rows:
+                        key_text = self.fitted_text(str(key), font_size=13, color=WHITE, max_width=1.2)
+                        val_text = self.fitted_text(str(val), font_size=13, color=WHITE, max_width=1.2)
+                        arrow = self.fitted_text("->", font_size=13, color=GRAY, max_width=0.35)
+                        row = VGroup(key_text, arrow, val_text).arrange(RIGHT, buff=0.08)
+                        box = RoundedRectangle(width=max(1.7, row.width + 0.25), height=0.34, corner_radius=0.05, color=BLUE, stroke_width=1.5)
+                        row.move_to(box.get_center())
+                        body.add(VGroup(box, row))
+                    body.arrange(DOWN, buff=0.06)
+                elif kind == "set":
+                    values = value[:10] if isinstance(value, list) else []
+                    for entry in values:
+                        circle = Circle(radius=0.2, color=TEAL, fill_color=TEAL, fill_opacity=0.35)
+                        label = self.fitted_text(str(entry), font_size=12, color=WHITE, max_width=0.35)
+                        label.move_to(circle.get_center())
+                        body.add(VGroup(circle, label))
+                    body.arrange(RIGHT, buff=0.08)
+                else:
+                    values = value[:10] if isinstance(value, list) else []
+                    for index, entry in enumerate(values):
+                        rect = RoundedRectangle(
+                            width=0.48,
+                            height=0.42,
+                            corner_radius=0.05,
+                            color=YELLOW if index == len(values) - 1 else BLUE,
+                            stroke_width=2.8 if index == len(values) - 1 else 1.5,
+                            fill_color=BLUE,
+                            fill_opacity=0.22,
+                        )
+                        label = self.fitted_text(str(entry), font_size=12, color=WHITE, max_width=0.38)
+                        label.move_to(rect.get_center())
+                        body.add(VGroup(rect, label))
+                    body.arrange(UP, buff=0.04)
+
+                if len(body) == 0:
+                    empty = self.fitted_text("(empty)", font_size=14, color=GRAY, max_width=1.4)
+                    body.add(empty)
+
+                body.next_to(title, DOWN, buff=0.22)
+                diagram.add(body)
+                return diagram
+
+            def render_binary_tree(self, step):
+                state = step["state"]
+                trees = state.get("binary_trees", {})
+                name = state.get("active_binary_tree")
+                if not name and trees:
+                    name = next(iter(trees))
+                tree_data = trees.get(name) if name else None
+                if not tree_data:
+                    return self.render_decision_tree(step)
+
+                adjacency = tree_data.get("adjacency", {})
+                labels = tree_data.get("labels", {})
+                root = tree_data.get("root")
+                if not adjacency or not root:
+                    return self.render_decision_tree(step)
+
+                try:
+                    if HAS_MANIM_DSA and MTree is not None:
+                        style = MTreeStyle.GREEN if MTreeStyle is not None else None
+                        tree = MTree(adjacency, root=root, style=style).node_layout() if style else MTree(adjacency, root=root).node_layout()
+                        overlays = VGroup()
+                        for node_id, label_value in labels.items():
+                            node_mobject = tree.nodes.get(str(node_id))
+                            if node_mobject is None:
+                                continue
+                            node_mobject.label.set_opacity(0)
+                            label = self.fitted_text(str(label_value), font_size=15, color=WHITE, max_width=0.45)
+                            label.move_to(node_mobject.get_center())
+                            overlays.add(label)
+                        title = self.fitted_text(f"{name} TreeNode", font_size=18, color=WHITE, max_width=2.8)
+                        group = VGroup(title, VGroup(tree, overlays)).arrange(DOWN, buff=0.22)
+                        return group
+                except Exception:
+                    pass
+
+                rows = {}
+                queue = [(root, 0)]
+                visited = set()
+                while queue:
+                    node_id, depth = queue.pop(0)
+                    if node_id in visited or depth > 5:
+                        continue
+                    visited.add(node_id)
+                    rows.setdefault(depth, []).append(node_id)
+                    for child in adjacency.get(node_id, []):
+                        queue.append((child, depth + 1))
+
+                diagram = VGroup()
+                title = self.fitted_text(f"{name} TreeNode", font_size=18, color=WHITE, max_width=2.8)
+                diagram.add(title)
+                positioned = {}
+                for depth, node_ids in rows.items():
+                    count = len(node_ids)
+                    y = 1.15 - depth * 0.62
+                    for index, node_id in enumerate(node_ids):
+                        x = 0 if count == 1 else -2.2 + 4.4 * index / max(1, count - 1)
+                        circle = Circle(radius=0.2, color=GREEN, fill_color=GREEN, fill_opacity=0.28)
+                        circle.move_to(RIGHT * x + UP * y)
+                        label = self.fitted_text(str(labels.get(node_id, "")), font_size=13, color=WHITE, max_width=0.34)
+                        label.move_to(circle.get_center())
+                        rendered = VGroup(circle, label)
+                        positioned[node_id] = rendered
+                        diagram.add(rendered)
+                for parent, children in adjacency.items():
+                    for child in children:
+                        if parent in positioned and child in positioned:
+                            diagram.add(Line(positioned[parent].get_bottom(), positioned[child].get_top(), color=GRAY, stroke_width=1.5).set_z_index(-1))
+                return diagram
+
             def render_call_tree(self, step):
                 state = step["state"]
                 calls = state.get("call_tree", [])
@@ -1402,18 +1945,92 @@ class AutoManimConverter:
 
                 return diagram
 
+            def render_call_tree_with_dsa(self, step):
+                if not HAS_MANIM_DSA or MTree is None:
+                    return self.render_call_tree(step)
+
+                state = step["state"]
+                calls = state.get("call_tree", [])
+                if not calls:
+                    return self.render_decision_tree(step)
+
+                try:
+                    labels_by_id = {}
+                    tree = {}
+                    for index, node in enumerate(calls):
+                        node_id = str(node.get("id") or f"call-{index}")
+                        label = str(node.get("label") or node_id)
+                        labels_by_id[node_id] = label[:28]
+                        tree.setdefault(node_id, [])
+
+                    root_id = str(calls[0].get("id") or "call-0")
+                    for node in calls:
+                        node_id = str(node.get("id"))
+                        parent_id = str(node.get("parent") or "")
+                        if parent_id and parent_id in tree and node_id in tree:
+                            tree[parent_id].append(node_id)
+
+                    style = MTreeStyle.BLUE if MTreeStyle is not None else None
+                    rendered = MTree(tree, root=root_id, style=style).node_layout() if style else MTree(tree, root=root_id).node_layout()
+
+                    # MTree labels are node ids by default. Overlay compact call labels so
+                    # the tree stays tied to the traced function calls.
+                    overlays = VGroup()
+                    for node_id, label in labels_by_id.items():
+                        node_mobject = rendered.nodes.get(node_id)
+                        if node_mobject is None:
+                            continue
+                        node_mobject.label.set_opacity(0)
+                        text = self.fitted_text(label, font_size=9, color=WHITE, max_width=1.05)
+                        text.move_to(node_mobject.get_center())
+                        overlays.add(text)
+
+                    active_id = str(state.get("active_call_id") or "")
+                    if active_id:
+                        active_node = rendered.nodes.get(active_id)
+                        if active_node is not None:
+                            active_node.circle.set_stroke(YELLOW, width=8)
+                            active_node.circle.set_fill(YELLOW, opacity=0.25)
+
+                    for node in calls:
+                        if node.get("status") != "done":
+                            continue
+                        node_id = str(node.get("id"))
+                        done_node = rendered.nodes.get(node_id)
+                        if done_node is not None and node_id != active_id:
+                            done_node.circle.set_stroke(GREEN, width=5)
+
+                    group = VGroup(rendered, overlays)
+                    return group
+                except Exception:
+                    return self.render_call_tree(step)
+
             def render_center_visual(self, step):
                 state = step["state"]
                 if state.get("call_tree") and not state.get("decision_tree"):
-                    call_tree = self.render_call_tree(step)
+                    call_tree = self.render_call_tree_with_dsa(step)
+                    if state.get("binary_trees"):
+                        tree = self.render_binary_tree(step)
+                        tree.scale(0.78)
+                        group = VGroup(call_tree, tree).arrange(DOWN, buff=0.28)
+                        return group
                     if state.get("tables"):
                         table = self.render_table(step)
                         table.scale(0.72)
                         group = VGroup(call_tree, table).arrange(DOWN, buff=0.28)
                         return group
+                    if state.get("collections"):
+                        collection = self.render_collection(step)
+                        collection.scale(0.78)
+                        group = VGroup(call_tree, collection).arrange(DOWN, buff=0.28)
+                        return group
                     return call_tree
                 if state.get("tables"):
                     return self.render_table(step)
+                if state.get("collections"):
+                    return self.render_collection(step)
+                if state.get("binary_trees"):
+                    return self.render_binary_tree(step)
                 return self.render_decision_tree(step)
 
             def render_array_node(self, values, slot_count, scale=0.5, highlight=False, active_kind=None, stroke_color=BLUE, color_mode=None):
@@ -1556,41 +2173,13 @@ class AutoManimConverter:
 
 # Usage example
 if __name__ == "__main__":
-    # Your LeetCode 90 JavaScript code
-    js_code = """
-    function solution(coins, amount) {
-// dp[i] stores the minimum number of coins to reach amount i
-    const dp = Array(amount + 1).fill(Infinity);
-    // lastCoin[i] stores the coin value used to reach amount i
-    const lastCoin = Array(amount + 1).fill(-1);
-    
-    dp[0] = 0;
+    snippets_dir = Path("media/texts/js")
+    tree_node_code = (snippets_dir / "tree_node.js").read_text(encoding="utf-8")
+    js_code = "\n\n".join([
+        tree_node_code,
+        (snippets_dir / "solution.js").read_text(encoding="utf-8"),
+    ])
 
-    for (let i = 1; i <= amount; i++) {
-        for (const coin of coins) {
-            if (i - coin >= 0 && dp[i - coin] + 1 < dp[i]) {
-                dp[i] = dp[i - coin] + 1;
-                lastCoin[i] = coin; // Track the coin used for this amount
-            }
-        }
-    }
-
-    // If amount is unreachable, return -1
-    //if (dp[amount] === Infinity) return -1;
-
-    // Reconstruct the combination by backtracking
-    const combination = [];
-    let current = amount;
-    while (current > 0) {
-        combination.push(lastCoin[current]);
-        current -= lastCoin[current];
-    }
-
-    return combination;
-    }
-    """
-
-    # Args map to subsetSumINaive(nums, target).
-    converter = AutoManimConverter(js_code, "solution", [[1,2,5],13])
-    viewer = converter.generate_interactive_viewer("coinchange_combination")
+    converter = AutoManimConverter(js_code, "solution", [[3,9,2,1,7],[9,3,1,2,7]])
+    viewer = converter.generate_interactive_viewer("buildtree")
     print(f"Interactive viewer: {viewer}")
