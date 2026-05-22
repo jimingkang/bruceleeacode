@@ -847,6 +847,9 @@ async function loadProblem(problem: Problem) {
   if (loadedProblem.code.trim()) {
     editor.setValue(loadedProblem.code);
     resetBreakpoints();
+    if (loadedProblem.source === 'deepseek') {
+      void generateInteractiveAnimationFromCode(loadedProblem, loadedProblem.code);
+    }
   }
 
   // Keep Output focused on the problem description. Solutions go directly into the editor.
@@ -865,6 +868,7 @@ async function loadProblem(problem: Problem) {
           loadedProblem.code = normalized;
           loadedProblem.source = 'deepseek';
           loadedProblem.isStarter = false;
+          void generateInteractiveAnimationFromCode(loadedProblem, normalized);
         }
       } catch (e) {
         // ignore extraction errors
@@ -1368,6 +1372,7 @@ async function fetchDeepSeekSolution(problem: Problem) {
           editor.setValue(normalized);
           resetBreakpoints();
           showStreamingOutput(extractAssistantExplanation(raw, normalized) || 'Solution moved to code editor.');
+          void generateInteractiveAnimationFromCode(problem, normalized);
           return normalized;
         }
         showStreamingOutput(raw);
@@ -1897,6 +1902,35 @@ function renderInteractiveAnimation(htmlPath: string, problem: Problem) {
 function hideAnimationPanel() {
   animationFrame.removeAttribute('src');
   animationPanel.classList.add('hidden');
+}
+
+async function generateInteractiveAnimationFromCode(problem: Problem, jsCode: string) {
+  try {
+    const parsedArgs = parseArguments(argsInput.value);
+    if (!Array.isArray(parsedArgs)) {
+      throw new Error('Function arguments must be a JSON array to generate animation.');
+    }
+
+    const response = await fetch('/algorithm/interactive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        problemId: problem.id,
+        titleSlug: problem.titleSlug ?? String(problem.id),
+        jsCode,
+        args: parsedArgs,
+      }),
+    });
+
+    const payload = (await response.json()) as AlgorithmInteractiveResponse;
+    if (!response.ok || !payload.htmlPath) {
+      throw new Error(payload.error ?? `Animation generation failed with ${response.status}.`);
+    }
+
+    showStreamingOutput(`Solution moved to code editor.\nGenerated animation: ${payload.htmlPath}`);
+  } catch (error) {
+    showStreamingOutput(`Solution moved to code editor.\nAnimation generation failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function generateAlgorithmGif(arrayData: unknown[], className: string) {

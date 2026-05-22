@@ -4,6 +4,7 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  base: './',
   plugins: [ollamaSolutionPlugin()],
   server: {
     // Note: binding to port 80 may require elevated privileges on Unix-like systems.
@@ -72,7 +73,7 @@ function ollamaSolutionPlugin() {
       });
 
       server.middlewares.use('/algorithm/interactive', async (request: any, response: any) => {
-        if (request.method !== 'GET') {
+        if (!['GET', 'POST'].includes(request.method ?? '')) {
           response.statusCode = 405;
           response.setHeader('Content-Type', 'application/json');
           response.end(JSON.stringify({ error: 'Method not allowed.' }));
@@ -80,12 +81,76 @@ function ollamaSolutionPlugin() {
         }
 
         try {
+          if (request.method === 'POST') {
+            const body = await readJsonBody(request);
+            const problemId = String(body.problemId ?? '').trim();
+            const titleSlug = String(body.titleSlug ?? 'solution').trim();
+            const jsCode = String(body.jsCode ?? '');
+            const args = body.args;
+
+            if (!/^\d+$/.test(problemId)) {
+              throw new Error('problemId must be a LeetCode number.');
+            }
+
+            if (!Array.isArray(args)) {
+              throw new Error('args must be a JSON array.');
+            }
+
+            const { execFile } = await import('child_process');
+            const pythonExecutable = path.resolve(process.cwd(), '.venv/bin/python');
+            const scriptPath = path.resolve(process.cwd(), 'scripts', 'generate_interactive_animation.py');
+
+            // Determine function name: prefer explicit body.functionName, else try to detect from jsCode, else default to 'solution'
+            let functionName = String(body.functionName ?? '').trim() || 'solution';
+            if (!body.functionName) {
+              const fnMatch1 = jsCode.match(/function\s+([A-Za-z_$][\w$]*)\s*\(/);
+              const fnMatch2 = jsCode.match(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:function|\()/);
+              const fnMatch3 = jsCode.match(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\([^)]*\)\s*=>/);
+              const detected = (fnMatch1 && fnMatch1[1]) || (fnMatch2 && fnMatch2[1]) || (fnMatch3 && fnMatch3[1]);
+              if (detected) functionName = detected;
+            }
+
+            const payload = JSON.stringify({ jsCode, args });
+            const execArgs = [scriptPath, '--leetcode-id', problemId, '--title-slug', titleSlug, '--function-name', functionName];
+
+            const generated = await new Promise<any>((resolve, reject) => {
+              const child = execFile(
+                pythonExecutable,
+                execArgs,
+                {
+                  cwd: process.cwd(),
+                  maxBuffer: 20 * 1024 * 1024,
+                  timeout: 120000,
+                },
+                (error: any, stdout: any, stderr: any) => {
+                  if (error) {
+                    reject(new Error(`${error.message}\n${String(stderr ?? stdout ?? '').slice(0, 4000)}`));
+                    return;
+                  }
+
+                  try {
+                    resolve(JSON.parse(String(stdout ?? '{}')));
+                  } catch {
+                    reject(new Error(`Animation generator returned invalid JSON: ${String(stdout ?? '').slice(0, 1000)}`));
+                  }
+                },
+              );
+
+              child.stdin?.end(payload);
+            });
+
+            const htmlPath = String(generated.htmlPath ?? '');
+            const mediaRelativePath = path.relative(path.resolve(process.cwd(), 'media'), path.resolve(process.cwd(), htmlPath)).split(path.sep).join('/');
+            response.setHeader('Content-Type', 'application/json');
+            response.end(JSON.stringify({ htmlPath: `/algorithm-media/${mediaRelativePath}` }));
+            return;
+          }
+
           const url = new URL(request.url ?? '/', 'http://localhost');
           const problemId = String(url.searchParams.get('problemId') ?? '').trim();
           if (!/^\d+$/.test(problemId)) {
             throw new Error('problemId must be a LeetCode number.');
           }
-
           const interactiveRoot = path.resolve(process.cwd(), 'media', 'interactive');
           const entries = await readdir(interactiveRoot, { withFileTypes: true }).catch(() => []);
           const match = entries

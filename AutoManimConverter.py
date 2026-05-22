@@ -3,15 +3,17 @@ from manim import *
 from pathlib import Path
 import json
 import subprocess
+import re
 from typing import Any, Dict, List
 
 class AutoManimConverter:
-    def __init__(self, js_code: str, function_name: str, args: list):
+    def __init__(self, js_code: str, function_name: str, args: list, leetcode_id: int | str | None = None):
         self.js_code = js_code
         self.function_name = function_name
         self.args = args
         self.call_args = self._normalize_call_args(args)
         self.visual_choices = self._extract_visual_choices(self.call_args)
+        self.variable_info = self._analyze_js_variables()
         self.trace = self._get_execution_trace()
         self.animation_steps = self._convert_trace_to_steps()
 
@@ -34,10 +36,58 @@ class AutoManimConverter:
                 return arg
         return call_args
 
+    def _analyze_js_variables(self) -> Dict[str, Any]:
+        """Find variables worth tracing from the provided JavaScript source."""
+
+        code = self.js_code
+        functions: Dict[str, List[str]] = {}
+        for match in re.finditer(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)", code):
+            params = [
+                part.strip().split("=")[0].strip()
+                for part in match.group(2).split(",")
+                if part.strip()
+            ]
+            functions[match.group(1)] = params
+
+        array_vars = set()
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\[\s*\]", code):
+            array_vars.add(match.group(1))
+
+        object_vars = set()
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\{\s*\}|new\s+(?:Map|Set)\s*\()", code):
+            object_vars.add(match.group(1))
+
+        declared_vars = set()
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", code):
+            declared_vars.add(match.group(1))
+        for match in re.finditer(r"\bfor\s*\(\s*(?:let|var|const)\s+([A-Za-z_$][\w$]*)\s*=", code):
+            declared_vars.add(match.group(1))
+
+        scalar_vars = sorted(declared_vars - array_vars - object_vars)
+        array_roles: Dict[str, str] = {}
+        for name in sorted(array_vars):
+            push_patterns = re.findall(rf"\b{re.escape(name)}\.push\(([^;\n]*)\)", code)
+            has_pop = re.search(rf"\b{re.escape(name)}\.pop\(\)", code) is not None
+            saves_copy = any(arg.strip().startswith("[") or arg.strip().startswith("Array.from(") for arg in push_patterns)
+            array_roles[name] = "result" if saves_copy and not has_pop else "subset" if has_pop else name
+
+        return {
+            "functions": functions,
+            "array_roles": array_roles,
+            "array_vars": sorted(array_vars),
+            "object_vars": sorted(object_vars),
+            "scalar_vars": scalar_vars,
+        }
+
     def _get_execution_trace(self) -> Dict:
         """Execute JS and capture execution trace"""
 
         instrumented_js_code = self._instrument_js_arrays(self.js_code)
+        function_params_by_name = self.variable_info.get("functions", {})
+        trace_wrappers = "\n".join(
+            f"        {name} = makeTracedFunction('{name}', {name});"
+            for name in function_params_by_name
+        )
         tracer_code = f"""
         // Enhanced tracer for algorithm visualization
         const executionTrace = [];
@@ -45,7 +95,42 @@ class AutoManimConverter:
         const trackedArrays = new WeakMap();
 
         function cloneValue(value) {{
-            return JSON.parse(JSON.stringify(value));
+            // Safe clone with depth and size limits to avoid huge JSON payloads
+            const MAX_STRING = 200;
+            const MAX_ARRAY = 20;
+            const MAX_OBJECT_KEYS = 200;
+            function _clone(v, depth) {{
+                if (depth < 0) {{
+                    if (v === null || v === undefined) return v;
+                    return typeof v === 'object' ? '[Object]' : String(v);
+                }}
+                if (v === null || v === undefined) return v;
+                const t = typeof v;
+                if (t === 'string') {{
+                    return v.length > MAX_STRING ? v.slice(0, MAX_STRING) + '...' : v;
+                }}
+                if (t === 'number' || t === 'boolean') return v;
+                if (Array.isArray(v)) {{
+                    const out = [];
+                    for (let i = 0; i < Math.min(v.length, MAX_ARRAY); i++) {{
+                        out.push(_clone(v[i], depth - 1));
+                    }}
+                    if (v.length > MAX_ARRAY) out.push('...(' + v.length + ' items)');
+                    return out;
+                }}
+                if (t === 'object') {{
+                    const obj = {{}};
+                    let count = 0;
+                    for (const k in v) {{
+                        if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+                        if (count++ >= MAX_OBJECT_KEYS) {{ obj['...'] = 'truncated'; break; }}
+                        try {{ obj[k] = _clone(v[k], depth - 1); }} catch (e) {{ obj[k] = String(v[k]); }}
+                    }}
+                    return obj;
+                }}
+                try {{ return String(v); }} catch {{ return null; }}
+            }}
+            try {{ return _clone(value, 3); }} catch {{ try {{ return String(value); }} catch {{ return null; }} }}
         }}
 
         function makeTrackedArray(name) {{
@@ -53,85 +138,131 @@ class AutoManimConverter:
             trackedArrays.set(array, name);
             return array;
         }}
-        
-        // Hook into array operations
-        const originalPush = Array.prototype.push;
-        Array.prototype.push = function(...items) {{
-            const arrayName = trackedArrays.get(this) || 'array';
-            const before = cloneValue(this);
-            const result = originalPush.apply(this, items);
-            const after = cloneValue(this);
-            originalPush.call(executionTrace, {{
+
+        // Limit events pushed to trace to avoid unbounded growth
+        const MAX_TRACE = 500;
+        function pushTrace(obj) {{
+            if (executionTrace.length < MAX_TRACE) {{
+                executionTrace.push(obj);
+            }}
+        }}
+
+        // Trace scalar variable assignments (minimal helper)
+        function traceAssign(name, value) {{
+            const v = value;
+            pushTrace({{
+                step: stepCounter++,
+                type: 'var_assign',
+                name,
+                value: cloneValue(v)
+            }});
+            return v;
+        }}
+
+        function arrayNameFor(array, fallbackName = 'array') {{
+            return trackedArrays.get(array) || fallbackName || 'array';
+        }}
+
+        function traceArrayPush(array, items, fallbackName = 'array') {{
+            const before = cloneValue(array);
+            const pushedItems = items || [];
+            const result = array.push(...pushedItems);
+            pushTrace({{
                 step: stepCounter++,
                 type: 'array_push',
-                arrayName,
+                arrayName: arrayNameFor(array, fallbackName),
+                variableName: fallbackName,
+                items: cloneValue(pushedItems),
                 before,
-                after,
-                items: cloneValue(items),
-                stackTrace: new Error().stack
+                after: cloneValue(array)
             }});
             return result;
-        }};
+        }}
 
-        const originalPop = Array.prototype.pop;
-        Array.prototype.pop = function() {{
-            const arrayName = trackedArrays.get(this) || 'array';
-            const before = cloneValue(this);
-            const item = originalPop.apply(this);
-            const after = cloneValue(this);
-            originalPush.call(executionTrace, {{
+        function traceArrayPop(array, fallbackName = 'array') {{
+            const before = cloneValue(array);
+            const item = array.pop();
+            pushTrace({{
                 step: stepCounter++,
                 type: 'array_pop',
-                arrayName,
-                before,
-                after,
+                arrayName: arrayNameFor(array, fallbackName),
+                variableName: fallbackName,
                 item: cloneValue(item),
-                stackTrace: new Error().stack
+                before,
+                after: cloneValue(array)
             }});
             return item;
-        }};
+        }}
+
+        function tracePropSet(obj, key, value, name = 'object') {{
+            obj[key] = value;
+            pushTrace({{
+                step: stepCounter++,
+                type: 'prop_set',
+                obj: name,
+                key: cloneValue(key),
+                value: cloneValue(value)
+            }});
+            return value;
+        }}
         
         // Your algorithm
         {instrumented_js_code}
         
-        // Hook into the backtrack function
-        const originalFunction = {self.function_name};
+        const functionParamsByName = {json.dumps(function_params_by_name)};
         let recursionDepth = 0;
-        
-        function tracedFunction(...args) {{
-            const entryStep = stepCounter++;
-            originalPush.call(executionTrace, {{
-                step: entryStep,
-                type: 'function_entry',
-                name: '{self.function_name}',
-                args: JSON.parse(JSON.stringify(args)),
-                depth: recursionDepth,
-                state: this.getState ? this.getState() : null
-            }});
-            
-            recursionDepth++;
-            const result = originalFunction.apply(this, args);
-            recursionDepth--;
-            
-            originalPush.call(executionTrace, {{
-                step: stepCounter++,
-                type: 'function_exit',
-                name: '{self.function_name}',
-                result: result,
-                depth: recursionDepth
-            }});
-            
-            return result;
+
+        function makeTracedFunction(name, originalFunction) {{
+            return function(...args) {{
+                pushTrace({{
+                    step: stepCounter++,
+                    type: 'function_entry',
+                    name,
+                    params: functionParamsByName[name] || [],
+                    args: cloneValue(args),
+                    depth: recursionDepth
+                }});
+
+                recursionDepth++;
+                const result = originalFunction.apply(this, args);
+                recursionDepth--;
+
+                pushTrace({{
+                    step: stepCounter++,
+                    type: 'function_exit',
+                    name,
+                    result: cloneValue(result),
+                    depth: recursionDepth
+                }});
+
+                return result;
+            }};
         }}
         
-        // Replace with traced version
-        {self.function_name} = tracedFunction;
+        // Replace detected functions with traced wrappers.
+{trace_wrappers}
         
         // Execute and capture everything
         const callArgs = {json.dumps(self.call_args)};
         const finalResult = {self.function_name}(...callArgs);
+        // Limit trace size to avoid very large JSON payloads
+        const outTrace = executionTrace.slice(0, Math.min(executionTrace.length, MAX_TRACE));
+        // Sanitize large or sensitive fields (stack traces) to keep payload small
+        for (const ev of outTrace) {{
+            try {{
+                if (ev && typeof ev.stackTrace === 'string') {{
+                    // Remove stackTrace entirely to avoid huge payloads
+                    delete ev.stackTrace;
+                }}
+                // Also trim any deeply nested value strings
+                if (ev && ev.value && typeof ev.value === 'string' && ev.value.length > 500) {{
+                    ev.value = ev.value.slice(0, 500) + '...(truncated)';
+                }}
+            }} catch (e) {{ /* ignore sanitizer errors */ }}
+        }}
         console.log(JSON.stringify({{
-            trace: executionTrace,
+            trace: outTrace,
+            trimmed: executionTrace.length > MAX_TRACE,
             result: finalResult,
             totalSteps: stepCounter
         }}));
@@ -141,7 +272,7 @@ class AutoManimConverter:
             ['node', '-e', tracer_code],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=180
         )
 
         if result.stdout:
@@ -151,23 +282,73 @@ class AutoManimConverter:
         return {"trace": [], "result": None}
 
     def _instrument_js_arrays(self, js_code: str) -> str:
-        """Replace common subset/result arrays with named tracked arrays."""
+        """Instrument variables found in the JavaScript source."""
 
-        replacements = {
-            "subset": "makeTrackedArray('subset')",
-            "path": "makeTrackedArray('subset')",
-            "current": "makeTrackedArray('subset')",
-            "res": "makeTrackedArray('result')",
-            "result": "makeTrackedArray('result')",
-            "results": "makeTrackedArray('result')",
-            "ans": "makeTrackedArray('result')",
-        }
+        replacements = self.variable_info.get("array_roles", {})
 
         instrumented = js_code
-        for name, factory in replacements.items():
+        for name, role in replacements.items():
+            factory = f"makeTrackedArray('{role}')"
             for keyword in ("const", "let", "var"):
                 instrumented = instrumented.replace(f"{keyword} {name} = []", f"{keyword} {name} = {factory}")
                 instrumented = instrumented.replace(f"{keyword} {name}=[]", f"{keyword} {name}={factory}")
+
+        vars_to_track = self.variable_info.get("scalar_vars", [])
+
+        # Protect for-loop headers to avoid modifying the initializer inside parentheses.
+        for_headers = []
+        def _header_replacer(m):
+            idx = len(for_headers)
+            for_headers.append(m.group(0))
+            return f"__FOR_HEADER_PLACEHOLDER_{idx}__"
+        instrumented = re.sub(r"for\s*\([^)]*\)\s*\{", _header_replacer, instrumented)
+
+        # Now safe to append traceAssign after declarations/assignments without touching for headers.
+        for v in vars_to_track:
+            # Declarations like "let left = expr;" -> "let left = expr; traceAssign('left', left);"
+            decl_pattern = rf"(\b(?:let|var|const)\s+{v}\s*=\s*)([^;\n]+);"
+            instrumented = re.sub(decl_pattern, lambda m: m.group(1) + m.group(2) + f"; traceAssign('{v}', {v});", instrumented)
+
+            # Assignments at start of a line: "left = expr;" -> "left = expr; traceAssign('left', left);"
+            assign_pattern = rf"(^|\n)(\s*){v}\s*=\s*([^;\n]+);"
+            instrumented = re.sub(assign_pattern, lambda m: m.group(1) + m.group(2) + f"{v} = " + m.group(3) + f"; traceAssign('{v}', {v});", instrumented, flags=re.MULTILINE)
+
+        # Restore for headers and inject traceAssign calls at the start of the loop body
+        def _restore_header(match):
+            placeholder = match.group(0)
+            idx = int(re.search(r"_(\d+)__", placeholder).group(1))
+            original = for_headers[idx]
+            # find which tracked vars appear in the header initializer
+            m = re.search(r"for\s*\(([^)]*)\)", original)
+            trace_calls = ""
+            if m:
+                init = m.group(1)
+                found = [v for v in vars_to_track if re.search(rf"\b{re.escape(v)}\b", init)]
+                if found:
+                    trace_calls = "".join([f" traceAssign('{v}', {v});" for v in found])
+            # insert trace calls immediately after the '{'
+            return original + trace_calls
+
+        instrumented = re.sub(r"__FOR_HEADER_PLACEHOLDER_\d+__", _restore_header, instrumented)
+
+        for obj in self.variable_info.get("object_vars", []):
+            instrumented = re.sub(rf"\b{obj}\s*\[\s*([^\]]+)\s*\]\s*=\s*([^;\n]+);",
+                                  rf"tracePropSet({obj}, \1, \2, '{obj}');", instrumented)
+
+        # Instrument array mutations after arrays have been wrapped with names.
+        array_vars = set(replacements.keys())
+        array_names = "|".join(sorted((re.escape(name) for name in array_vars), key=len, reverse=True))
+        if array_names:
+            instrumented = re.sub(
+                rf"\b({array_names})\.push\(([^;\n]*)\);",
+                lambda m: f"traceArrayPush({m.group(1)}, [{m.group(2)}], '{m.group(1)}');",
+                instrumented,
+            )
+            instrumented = re.sub(
+                rf"\b({array_names})\.pop\(\);",
+                lambda m: f"traceArrayPop({m.group(1)}, '{m.group(1)}');",
+                instrumented,
+            )
 
         return instrumented
 
@@ -180,12 +361,43 @@ class AutoManimConverter:
             "result": [],
             "index": 0,
             "call_stack": [],
-            "decision_tree": []
+            "decision_tree": [],
+            "locals": {}
         }
+        local_scopes = []
+        array_vars = set(self.variable_info.get("array_vars", []))
+        object_vars = set(self.variable_info.get("object_vars", []))
 
         for trace_item in self.trace.get("trace", []):
+            if trace_item["type"] == "var_assign":
+                name = trace_item.get("name")
+                val = trace_item.get("value")
+                # record local
+                if name:
+                    current_state.setdefault("locals", {})[name] = val
+                steps.append({
+                    "action": f"{name} = {val}",
+                    "state": self._copy_state(current_state)
+                })
+                continue
+
+            if trace_item["type"] == "prop_set":
+                obj = trace_item.get("arrayName") or trace_item.get("obj")
+                key = trace_item.get("key")
+                val = trace_item.get("value")
+                if obj:
+                    current_state.setdefault("locals", {}).setdefault(obj, {})[str(key)] = val
+                steps.append({
+                    "action": f"{obj}[{key}] = {val}",
+                    "state": self._copy_state(current_state)
+                })
+                continue
+
             if trace_item["type"] == "array_push":
                 array_name = self._classify_array_event(trace_item)
+                variable_name = trace_item.get("variableName")
+                if variable_name:
+                    current_state.setdefault("locals", {})[variable_name] = trace_item.get("after")
                 if array_name == "subset":
                     current_state["subset"] = trace_item["after"]
                     item = trace_item["items"][0] if trace_item.get("items") else None
@@ -220,6 +432,9 @@ class AutoManimConverter:
 
             elif trace_item["type"] == "array_pop":
                 array_name = self._classify_array_event(trace_item)
+                variable_name = trace_item.get("variableName")
+                if variable_name:
+                    current_state.setdefault("locals", {})[variable_name] = trace_item.get("after")
                 if array_name == "subset":
                     item = trace_item.get("item")
                     current_state["subset"] = trace_item["after"]
@@ -240,6 +455,13 @@ class AutoManimConverter:
                     })
 
             elif trace_item["type"] == "function_entry":
+                local_scopes.append(self._copy_state(current_state.get("locals", {})))
+                current_state.setdefault("call_stack", []).append(trace_item.get("name"))
+                params = trace_item.get("params") or []
+                args = trace_item.get("args") or []
+                for index, arg in enumerate(args):
+                    name = params[index] if index < len(params) else f"arg{index}"
+                    current_state.setdefault("locals", {})[name] = arg
                 steps.append({
                     "action": f"Call {trace_item['name']} with {trace_item['args']}",
                     "state": self._copy_state(current_state),
@@ -247,6 +469,14 @@ class AutoManimConverter:
                 })
 
             elif trace_item["type"] == "function_exit":
+                if local_scopes:
+                    restored_locals = local_scopes.pop()
+                    for name in array_vars | object_vars:
+                        if name in current_state.get("locals", {}):
+                            restored_locals[name] = current_state["locals"][name]
+                    current_state["locals"] = restored_locals
+                if current_state.get("call_stack"):
+                    current_state["call_stack"].pop()
                 steps.append({
                     "action": f"Return from {trace_item['name']}",
                     "state": self._copy_state(current_state)
@@ -293,6 +523,7 @@ class AutoManimConverter:
             "choices": self.visual_choices,
             "steps": self.animation_steps,
             "result": self.trace.get("result", []),
+            "variables": self.variable_info,
         }
 
         output_path.write_text(
@@ -469,6 +700,30 @@ class AutoManimConverter:
       return JSON.stringify(subset || []);
     }}
 
+    function renderStatePanel(state, active) {{
+      const panel = document.getElementById("statePanel");
+      panel.innerHTML = "";
+      const lines = [
+        ["subset[]", state.subset || []],
+        ["decision", active?.label || "-"],
+      ];
+      const locals = state.locals || {{}};
+      Object.keys(locals).sort().forEach((name) => {{
+        lines.push([name, locals[name]]);
+      }});
+
+      const seen = new Set();
+      lines.forEach(([name, value]) => {{
+        const key = `${{name}}:${{JSON.stringify(value)}}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const line = document.createElement("div");
+        line.className = "state-line";
+        line.textContent = `${{name}}: ${{typeof value === "string" ? value : JSON.stringify(value)}}`;
+        panel.append(line);
+      }});
+    }}
+
     function drawConnectors() {{
       const treePanel = document.getElementById("treePanel");
       const previous = treePanel.querySelector(".tree-lines");
@@ -521,10 +776,7 @@ class AutoManimConverter:
       const slotCount = Math.max(1, Array.isArray(choicesData) ? choicesData.length : 1);
 
       document.getElementById("stepBox").textContent = `Step ${{currentStep + 1}}: ${{step.action || "Start"}}`;
-      document.getElementById("statePanel").innerHTML = `
-        <div class="state-line">subset[]: ${{JSON.stringify(state.subset || [])}}</div>
-        <div class="state-line">decision: ${{active?.label || "-"}}</div>
-      `;
+      renderStatePanel(state, active);
       document.getElementById("resultBox").textContent = `Result: ${{JSON.stringify(state.result || [])}}`;
 
       const treePanel = document.getElementById("treePanel");
@@ -652,9 +904,11 @@ class AutoManimConverter:
                 ]
                 if state.get("decision_tree"):
                     lines.append(f"decision: {state['decision_tree'][-1]['label']}")
+                for name, value in sorted(state.get("locals", {}).items()):
+                    lines.append(f"{name}: {value}")
 
                 group = VGroup()
-                for line in lines:
+                for line in lines[:10]:
                     group.add(self.fitted_text(line, font_size=16, max_width=5.2))
                 group.arrange(DOWN, aligned_edge=LEFT, buff=0.18)
                 return group
@@ -881,39 +1135,39 @@ class AutoManimConverter:
 if __name__ == "__main__":
     # Your LeetCode 90 JavaScript code
     js_code = """
-/* 回溯算法：子集和 I */
-function backtrack(state, target, total, choices, res) {
-    // 子集和等于 target 时，记录解
-    if (total === target) {
-        res.push([...state]);
-        return;
+function  solution(s) {
+    const n = s.length;
+    if (n === 0) return "";
+    
+    let start = 0, maxLength = 1;
+    const dp = Array.from({ length: n }, () => Array(n).fill(false));
+    
+    for (let i = 0; i < n; i++) {
+        dp[i][i] = true; // Single chars are palindromes
     }
-    // 遍历所有选择
-    for (let i = 0; i < choices.length; i++) {
-        // 剪枝：若子集和超过 target ，则跳过该选择
-        if (total + choices[i] > target) {
-            continue;
+    
+    for (let length = 2; length <= n; length++) {
+        for (let i = 0; i <= n - length; i++) {
+            const j = i + length - 1;
+            if (s[i] === s[j]) {
+                if (length === 2) {
+                    dp[i][j] = true;
+                } else {
+                    dp[i][j] = dp[i + 1][j - 1];
+                }
+                if (dp[i][j] && length > maxLength) {
+                    start = i;
+                    maxLength = length;
+                }
+            }
         }
-        // 尝试：做出选择，更新元素和 total
-        state.push(choices[i]);
-        // 进行下一轮选择
-        backtrack(state, target, total + choices[i], choices, res);
-        // 回退：撤销选择，恢复到之前的状态
-        state.pop();
     }
-}
-
-/* 求解子集和 I（包含重复子集） */
-function subsetSumINaive(nums, target) {
-    const state = []; // 状态（子集）
-    const total = 0; // 子集和
-    const res = []; // 结果列表（子集列表）
-    backtrack(state, target, total, nums, res);
-    return res;
+    
+    return s.substring(start, start + maxLength);
 }
     """
 
     # Args map to subsetSumINaive(nums, target).
-    converter = AutoManimConverter(js_code, "subsetSumINaive", [[1, 2, 2], 3])
-    viewer = converter.generate_interactive_viewer("90_subsets-ii_interactive")
+    converter = AutoManimConverter(js_code, "solution", "babad")
+    viewer = converter.generate_interactive_viewer("5_longest_palindromic_substring")
     print(f"Interactive viewer: {viewer}")
