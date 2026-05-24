@@ -297,18 +297,17 @@ class AutoManimConverter:
 
         function normalizeTreeCallArgs(rawArgs, params) {{
             if (!Array.isArray(rawArgs) || !rawArgs.length) return rawArgs;
-            if (!Array.isArray(rawArgs[0])) return rawArgs;
 
-            const firstParam = String(params[0] || '').trim().toLowerCase();
             const rootNames = new Set(['root', 'node', 'tree', 'head']);
-            if (!rootNames.has(firstParam)) return rawArgs;
+            const rootIndex = params.findIndex((param) => rootNames.has(String(param || '').trim().toLowerCase()));
+            if (rootIndex < 0 || !Array.isArray(rawArgs[rootIndex])) return rawArgs;
 
-            const root = buildTreeFromLevelOrder(rawArgs[0]);
+            const root = buildTreeFromLevelOrder(rawArgs[rootIndex]);
             if (!isTreeNode(root)) return rawArgs;
 
             const nodeParamNames = new Set(['p', 'q', 'target', 'targetnode', 'node', 'node1', 'node2']);
             return rawArgs.map((arg, index) => {{
-                if (index === 0) return root;
+                if (index === rootIndex) return root;
                 const paramName = String(params[index] || '').trim().toLowerCase();
                 if (nodeParamNames.has(paramName) && !Array.isArray(arg) && (arg === null || typeof arg !== 'object')) {{
                     return findTreeNodeByValue(root, arg) || arg;
@@ -689,6 +688,7 @@ class AutoManimConverter:
             "active_collection": None,
             "binary_trees": {},
             "active_binary_tree": None,
+            "active_binary_node_value": None,
             "locals": {}
         }
         local_scopes = []
@@ -709,6 +709,8 @@ class AutoManimConverter:
                     if trace_item.get("binaryTree"):
                         current_state.setdefault("binary_trees", {})[name] = trace_item["binaryTree"]
                         current_state["active_binary_tree"] = name
+                        if isinstance(val, dict) and "val" in val:
+                            current_state["active_binary_node_value"] = val.get("val")
                 steps.append({
                     "action": f"{name} = {val}",
                     "state": self._copy_state(current_state)
@@ -872,15 +874,25 @@ class AutoManimConverter:
                     current_state.setdefault("locals", {})[name] = arg
                     binary_trees = trace_item.get("binaryTrees") or []
                     if index < len(binary_trees) and binary_trees[index]:
-                        current_state.setdefault("binary_trees", {})[name] = binary_trees[index]
-                        current_state["active_binary_tree"] = name
+                        normalized_name = str(name).strip().lower()
+                        is_root_tree = normalized_name in {"root", "tree", "head"}
+                        binary_tree_state = current_state.setdefault("binary_trees", {})
+                        if not (is_root_tree and name in binary_tree_state):
+                            binary_tree_state[name] = binary_trees[index]
+                        if is_root_tree or not current_state.get("active_binary_tree"):
+                            current_state["active_binary_tree"] = name
+                        if is_root_tree and isinstance(arg, dict) and "val" in arg:
+                            current_state["active_binary_node_value"] = arg.get("val")
                     if name in table_vars and isinstance(arg, list):
                         current_state.setdefault("tables", {})[name] = arg
                         current_state["active_table"] = name
                         current_state["active_cell"] = None
                 node_id = f"call-{call_node_counter}"
                 call_node_counter += 1
-                label_args = ", ".join(f"{params[index] if index < len(params) else f'arg{index}'}={arg}" for index, arg in enumerate(args[:3]))
+                label_args = ", ".join(
+                    f"{params[index] if index < len(params) else f'arg{index}'}={self._format_trace_value(arg)}"
+                    for index, arg in enumerate(args[:3])
+                )
                 if len(args) > 3:
                     label_args += ", ..."
                 current_state.setdefault("call_tree", []).append({
@@ -893,7 +905,7 @@ class AutoManimConverter:
                 call_node_stack.append(node_id)
                 current_state["active_call_id"] = node_id
                 steps.append({
-                    "action": f"Call {trace_item['name']} with {trace_item['args']}",
+                    "action": f"Call {trace_item['name']} with [{', '.join(self._format_trace_value(arg) for arg in args)}]",
                     "state": self._copy_state(current_state),
                     "depth": trace_item["depth"]
                 })
@@ -923,6 +935,24 @@ class AutoManimConverter:
 
     def _copy_state(self, state: Dict) -> Dict:
         return json.loads(json.dumps(state))
+
+    def _format_trace_value(self, value: Any) -> str:
+        if isinstance(value, dict):
+            if {"val", "left", "right"}.issubset(value.keys()):
+                return f"TreeNode({value.get('val')})"
+            if len(value) > 4:
+                keys = list(value.keys())[:3]
+                preview = ", ".join(f"{key}: {self._format_trace_value(value[key])}" for key in keys)
+                return "{" + preview + ", ...}"
+            return "{" + ", ".join(f"{key}: {self._format_trace_value(val)}" for key, val in value.items()) + "}"
+        if isinstance(value, list):
+            if len(value) > 6:
+                preview = ", ".join(self._format_trace_value(item) for item in value[:5])
+                return f"[{preview}, ...]"
+            return "[" + ", ".join(self._format_trace_value(item) for item in value) + "]"
+        if value is None:
+            return "null"
+        return str(value)
 
     def _classify_array_event(self, trace_item: Dict) -> str:
         array_name = trace_item.get("arrayName")
@@ -1399,6 +1429,15 @@ class AutoManimConverter:
       return JSON.stringify(value);
     }}
 
+    function displayResult(value) {{
+      if (value === null) return "null";
+      if (value === undefined) return "";
+      if (value && typeof value === "object" && "val" in value && "left" in value && "right" in value) {{
+        return `TreeNode(${{value.val}})`;
+      }}
+      return displayValue(value);
+    }}
+
     function renderCollectionPanel(state, belowTree = false) {{
       const treePanel = document.getElementById("treePanel");
       const collections = state.collections || {{}};
@@ -1657,7 +1696,8 @@ class AutoManimConverter:
 
       document.getElementById("stepBox").textContent = `Step ${{currentStep + 1}}: ${{step.action || "Start"}}`;
       renderStatePanel(state, active);
-      document.getElementById("resultBox").textContent = `Result: ${{JSON.stringify(state.result || [])}}`;
+      const finalResult = data.result !== undefined ? data.result : state.result || [];
+      document.getElementById("resultBox").textContent = `Final Result: ${{displayResult(finalResult)}}`;
 
       const treePanel = document.getElementById("treePanel");
       treePanel.innerHTML = "";
@@ -2395,6 +2435,6 @@ if __name__ == "__main__":
         (snippets_dir / "solution.js").read_text(encoding="utf-8"),
     ])
 
-    converter = AutoManimConverter(js_code, "solution", [[3,9,2,1,7],[9,3,1,2,7]])
-    viewer = converter.generate_interactive_viewer("buildtree")
+    converter = AutoManimConverter(js_code, "solution", [[6,2,8,0,4,7,9,'null','null',3,5], 3, 5])
+    viewer = converter.generate_interactive_viewer("lca")
     print(f"Interactive viewer: {viewer}")
