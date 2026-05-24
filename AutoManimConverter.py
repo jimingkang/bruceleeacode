@@ -235,6 +235,88 @@ class AutoManimConverter:
             return {{ root: rootId, adjacency, labels }};
         }}
 
+        class AutoTraceTreeNode {{
+            constructor(val, left = null, right = null) {{
+                this.val = val === undefined ? 0 : val;
+                this.left = left;
+                this.right = right;
+            }}
+        }}
+
+        function treeNodeCtor() {{
+            return typeof TreeNode === 'function' ? TreeNode : AutoTraceTreeNode;
+        }}
+
+        function isNullTreeSlot(value) {{
+            if (value === null || value === undefined) return true;
+            if (typeof value !== 'string') return false;
+            const normalized = value.trim().toLowerCase();
+            return normalized === 'null' || normalized === 'none' || normalized === 'undefined';
+        }}
+
+        function buildTreeFromLevelOrder(values) {{
+            if (!Array.isArray(values) || values.length === 0 || isNullTreeSlot(values[0])) return null;
+            const NodeCtor = treeNodeCtor();
+            const root = new NodeCtor(values[0]);
+            const queue = [root];
+            let index = 1;
+            while (queue.length && index < values.length) {{
+                const node = queue.shift();
+                if (!node) continue;
+
+                const leftValue = values[index++];
+                if (!isNullTreeSlot(leftValue)) {{
+                    node.left = new NodeCtor(leftValue);
+                    queue.push(node.left);
+                }}
+
+                if (index >= values.length) break;
+                const rightValue = values[index++];
+                if (!isNullTreeSlot(rightValue)) {{
+                    node.right = new NodeCtor(rightValue);
+                    queue.push(node.right);
+                }}
+            }}
+            return root;
+        }}
+
+        function findTreeNodeByValue(root, target) {{
+            if (!isTreeNode(root)) return null;
+            const queue = [root];
+            const seen = new WeakSet();
+            while (queue.length) {{
+                const node = queue.shift();
+                if (!node || seen.has(node)) continue;
+                seen.add(node);
+                if (Object.is(node.val, target) || node.val === target) return node;
+                if (node.left) queue.push(node.left);
+                if (node.right) queue.push(node.right);
+            }}
+            return null;
+        }}
+
+        function normalizeTreeCallArgs(rawArgs, params) {{
+            if (!Array.isArray(rawArgs) || !rawArgs.length) return rawArgs;
+            if (!Array.isArray(rawArgs[0])) return rawArgs;
+
+            const firstParam = String(params[0] || '').trim().toLowerCase();
+            const rootNames = new Set(['root', 'node', 'tree', 'head']);
+            if (!rootNames.has(firstParam)) return rawArgs;
+
+            const root = buildTreeFromLevelOrder(rawArgs[0]);
+            if (!isTreeNode(root)) return rawArgs;
+
+            const nodeParamNames = new Set(['p', 'q', 'target', 'targetnode', 'node', 'node1', 'node2']);
+            return rawArgs.map((arg, index) => {{
+                if (index === 0) return root;
+                const paramName = String(params[index] || '').trim().toLowerCase();
+                if (nodeParamNames.has(paramName) && !Array.isArray(arg) && (arg === null || typeof arg !== 'object')) {{
+                    return findTreeNodeByValue(root, arg) || arg;
+                }}
+                return arg;
+            }});
+        }}
+
         function arrayNameFor(array, fallbackName = 'array') {{
             return trackedArrays.get(array) || fallbackName || 'array';
         }}
@@ -424,7 +506,8 @@ class AutoManimConverter:
 {trace_wrappers}
         
         // Execute and capture everything
-        const callArgs = {json.dumps(self.call_args)};
+        const rawCallArgs = {json.dumps(self.call_args)};
+        const callArgs = normalizeTreeCallArgs(rawCallArgs, functionParamsByName[{json.dumps(self.function_name)}] || []);
         const finalResult = {self.function_name}(...callArgs);
         // Limit trace size to avoid very large JSON payloads
         const outTrace = executionTrace.slice(0, Math.min(executionTrace.length, MAX_TRACE));
@@ -942,7 +1025,7 @@ class AutoManimConverter:
     .state-panel h2, .tree-panel h2 {{ margin: 0 0 10px; color: #15803d; font-size: 15px; text-transform: uppercase; }}
     .state-line {{ margin: 8px 0; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }}
     .tree-panel {{ min-height: 500px; padding: 14px; overflow: auto; position: relative; }}
-    #treePanel {{ position: relative; min-width: max-content; }}
+    #treePanel {{ position: relative; min-width: 100%; }}
     .tree-lines {{
       position: absolute;
       inset: 0;
@@ -950,7 +1033,7 @@ class AutoManimConverter:
       pointer-events: none;
       z-index: 0;
     }}
-    .summary-row {{ display: flex; justify-content: space-around; gap: 18px; margin-bottom: 24px; }}
+    .summary-row {{ display: flex; justify-content: center; gap: 48px; margin-bottom: 24px; }}
     .summary-item {{ display: flex; align-items: center; gap: 8px; font-weight: 800; }}
     .tree-row {{
       display: grid;
@@ -962,7 +1045,7 @@ class AutoManimConverter:
       z-index: 1;
     }}
     .row-label {{ color: #475569; font-weight: 800; font-size: 13px; }}
-    .nodes {{ display: flex; justify-content: flex-start; gap: 18px; min-width: max-content; }}
+    .nodes {{ display: flex; justify-content: center; gap: 18px; min-width: 0; }}
     .root-row .nodes {{
       justify-content: center;
       min-width: 100%;
@@ -990,12 +1073,13 @@ class AutoManimConverter:
       background: #f8fafc;
     }}
     .table-wrap {{ display: inline-block; min-width: max-content; }}
-    .table-wrap.below-tree {{ display: block; margin-top: 22px; }}
+    .table-wrap.below-tree {{ display: block; width: fit-content; margin: 22px auto 0; }}
     .table-title {{ margin: 2px 0 10px; color: #17212f; font-weight: 800; }}
     .collection-wrap, .binary-tree-wrap {{
-      display: block;
-      min-width: max-content;
-      margin-top: 22px;
+        display: block;
+      width: fit-content;
+      min-width: 0;
+      margin: 22px auto 0;
       position: relative;
       z-index: 1;
     }}
@@ -1065,7 +1149,35 @@ class AutoManimConverter:
       box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.25);
     }}
     .call-node.done {{ border-color: #22c55e; }}
+    .tree-canvas {{
+      position: relative;
+      min-width: 320px;
+      min-height: 140px;
+      margin: 8px auto 0;
+    }}
+    .tree-canvas svg {{
+      position: absolute;
+      inset: 0;
+      overflow: visible;
+      pointer-events: none;
+      z-index: 0;
+    }}
+    .tree-edge {{
+      stroke: #94a3b8;
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }}
+    .call-tree-node-wrap {{
+      position: absolute;
+      z-index: 1;
+      display: flex;
+      justify-content: center;
+      width: 190px;
+    }}
     .binary-node {{
+      position: absolute;
       width: 38px;
       height: 38px;
       display: inline-grid;
@@ -1077,6 +1189,13 @@ class AutoManimConverter:
       font-family: "SFMono-Regular", Consolas, monospace;
       font-size: 13px;
       font-weight: 850;
+      z-index: 1;
+    }}
+    .binary-node.active {{
+      border-color: #dc2626;
+      background: #fee2e2;
+      color: #991b1b;
+      box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.18);
     }}
     .binary-tree-wrap .tree-row {{ grid-template-columns: 74px minmax(0, 1fr); }}
     .binary-tree-wrap .nodes {{ gap: 34px; }}
@@ -1339,20 +1458,34 @@ class AutoManimConverter:
 
       const adjacency = tree.adjacency || {{}};
       const labels = tree.labels || {{}};
-      const rows = new Map();
-      const queue = [{{ id: tree.root, depth: 0, parent: "" }}];
+      const activeNodeValue = state.active_binary_node_value;
+      const depthByNode = new Map();
+      const xByNode = new Map();
       const seen = new Set();
-      while (queue.length) {{
-        const current = queue.shift();
-        if (!current || seen.has(current.id)) continue;
-        seen.add(current.id);
-        if (!rows.has(current.depth)) rows.set(current.depth, []);
-        rows.get(current.depth).push(current);
-        (adjacency[current.id] || []).forEach((childId) => {{
-          queue.push({{ id: childId, depth: current.depth + 1, parent: current.id }});
-        }});
+      let leafIndex = 0;
+      let maxDepth = 0;
+
+      function assignPosition(nodeId, depth) {{
+        if (!nodeId || seen.has(nodeId)) return xByNode.get(nodeId) ?? leafIndex;
+        seen.add(nodeId);
+        depthByNode.set(nodeId, depth);
+        maxDepth = Math.max(maxDepth, depth);
+
+        const children = adjacency[nodeId] || [];
+        if (!children.length) {{
+          xByNode.set(nodeId, leafIndex);
+          leafIndex += 1;
+          return xByNode.get(nodeId);
+        }}
+
+        const childXs = children.map((childId) => assignPosition(childId, depth + 1));
+        const x = childXs.reduce((sum, value) => sum + value, 0) / childXs.length;
+        xByNode.set(nodeId, x);
+        return x;
       }}
-      if (!rows.size) return false;
+
+      assignPosition(tree.root, 0);
+      if (!seen.size) return false;
 
       const wrap = document.createElement("div");
       wrap.className = "binary-tree-wrap" + (belowTree ? " below-tree" : "");
@@ -1361,34 +1494,57 @@ class AutoManimConverter:
       title.textContent = `${{treeName}} TreeNode`;
       wrap.append(title);
 
-      const maxDepth = Math.max(...rows.keys());
-      for (let depth = 0; depth <= maxDepth; depth += 1) {{
-        const row = document.createElement("div");
-        row.className = "tree-row";
-        if (depth === 0) row.classList.add("root-row");
-        row.style.margin = "22px 0";
-        const label = document.createElement("div");
-        label.className = "row-label";
-        label.textContent = depth === 0 ? "root" : `depth ${{depth}}`;
-        const nodes = document.createElement("div");
-        nodes.className = "nodes";
-        (rows.get(depth) || []).forEach((item) => {{
-          const nodeWrap = document.createElement("div");
-          nodeWrap.className = "node-wrap";
-          nodeWrap.dataset.nodeKey = `binary:${{item.id}}`;
-          if (item.parent) nodeWrap.dataset.parentKey = `binary:${{item.parent}}`;
-          const node = document.createElement("div");
-          node.className = "binary-node";
-          node.textContent = displayValue(labels[item.id]);
-          nodeWrap.append(node);
-          nodes.append(nodeWrap);
+      const nodeSize = 38;
+      const horizontalGap = 92;
+      const verticalGap = 74;
+      const paddingX = 28;
+      const paddingY = 22;
+      const width = Math.max(260, Math.max(1, leafIndex) * horizontalGap + paddingX * 2);
+      const height = Math.max(120, (maxDepth + 1) * verticalGap + paddingY * 2);
+      const canvas = document.createElement("div");
+      canvas.className = "tree-canvas";
+      canvas.style.width = `${{width}}px`;
+      canvas.style.height = `${{height}}px`;
+
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("width", String(width));
+      svg.setAttribute("height", String(height));
+
+      const pointFor = (nodeId) => ({{
+        x: paddingX + xByNode.get(nodeId) * horizontalGap + nodeSize / 2,
+        y: paddingY + depthByNode.get(nodeId) * verticalGap + nodeSize / 2,
+      }});
+
+      for (const [parentId, children] of Object.entries(adjacency)) {{
+        if (!seen.has(parentId)) continue;
+        const parentPoint = pointFor(parentId);
+        children.forEach((childId) => {{
+          if (!seen.has(childId)) return;
+          const childPoint = pointFor(childId);
+          const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          line.classList.add("tree-edge");
+          line.setAttribute("x1", String(parentPoint.x));
+          line.setAttribute("y1", String(parentPoint.y + nodeSize / 2));
+          line.setAttribute("x2", String(childPoint.x));
+          line.setAttribute("y2", String(childPoint.y - nodeSize / 2));
+          svg.append(line);
         }});
-        row.append(label, nodes);
-        wrap.append(row);
+      }}
+      canvas.append(svg);
+
+      for (const nodeId of seen) {{
+        const point = pointFor(nodeId);
+        const isActive = activeNodeValue !== null && activeNodeValue !== undefined && labels[nodeId] === activeNodeValue;
+        const node = document.createElement("div");
+        node.className = "binary-node" + (isActive ? " active" : "");
+        node.style.left = `${{point.x - nodeSize / 2}}px`;
+        node.style.top = `${{point.y - nodeSize / 2}}px`;
+        node.textContent = displayValue(labels[nodeId]);
+        canvas.append(node);
       }}
 
+      wrap.append(canvas);
       treePanel.append(wrap);
-      requestAnimationFrame(drawConnectors);
       return true;
     }}
 
@@ -1397,38 +1553,97 @@ class AutoManimConverter:
       const calls = state.call_tree || [];
       if (!calls.length) return false;
 
-      const nodesByDepth = new Map();
+      const byId = new Map(calls.map((node) => [node.id, node]));
+      const childrenByParent = new Map();
+      const roots = [];
       calls.forEach((node) => {{
-        if (!nodesByDepth.has(node.depth)) nodesByDepth.set(node.depth, []);
-        nodesByDepth.get(node.depth).push(node);
+        const parent = node.parent || "";
+        if (!parent || !byId.has(parent)) {{
+          roots.push(node.id);
+          return;
+        }}
+        if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+        childrenByParent.get(parent).push(node.id);
       }});
 
-      const maxDepth = Math.max(...nodesByDepth.keys());
-      for (let depth = 0; depth <= maxDepth; depth += 1) {{
-        const row = document.createElement("div");
-        row.className = "tree-row";
-        if (depth === 0) row.classList.add("root-row");
-        row.style.margin = "28px 0";
-        const label = document.createElement("div");
-        label.className = "row-label";
-        label.textContent = depth === 0 ? "root" : `depth ${{depth}}`;
-        const nodes = document.createElement("div");
-        nodes.className = "nodes";
-        (nodesByDepth.get(depth) || []).forEach((item) => {{
-          const wrap = document.createElement("div");
-          wrap.className = "node-wrap";
-          wrap.dataset.nodeKey = item.id;
-          if (item.parent) wrap.dataset.parentKey = item.parent;
-          const node = document.createElement("div");
-          node.className = "call-node" + (item.id === state.active_call_id ? " active" : "") + (item.status === "done" ? " done" : "");
-          node.textContent = item.label;
-          wrap.append(node);
-          nodes.append(wrap);
-        }});
-        row.append(label, nodes);
-        treePanel.append(row);
+      const xByNode = new Map();
+      const depthByNode = new Map();
+      const seen = new Set();
+      let leafIndex = 0;
+      let maxDepth = 0;
+
+      function assignPosition(nodeId, depth) {{
+        if (!nodeId || seen.has(nodeId)) return xByNode.get(nodeId) ?? leafIndex;
+        seen.add(nodeId);
+        depthByNode.set(nodeId, depth);
+        maxDepth = Math.max(maxDepth, depth);
+        const children = childrenByParent.get(nodeId) || [];
+        if (!children.length) {{
+          xByNode.set(nodeId, leafIndex);
+          leafIndex += 1;
+          return xByNode.get(nodeId);
+        }}
+        const childXs = children.map((childId) => assignPosition(childId, depth + 1));
+        const x = childXs.reduce((sum, value) => sum + value, 0) / childXs.length;
+        xByNode.set(nodeId, x);
+        return x;
       }}
-      requestAnimationFrame(drawConnectors);
+
+      roots.forEach((rootId) => assignPosition(rootId, 0));
+      if (!seen.size) return false;
+
+      const nodeWidth = 190;
+      const nodeHeight = 54;
+      const horizontalGap = 230;
+      const verticalGap = 92;
+      const paddingX = 24;
+      const paddingY = 18;
+      const width = Math.max(360, Math.max(1, leafIndex) * horizontalGap + paddingX * 2);
+      const height = Math.max(150, (maxDepth + 1) * verticalGap + paddingY * 2 + nodeHeight);
+      const canvas = document.createElement("div");
+      canvas.className = "tree-canvas";
+      canvas.style.width = `${{width}}px`;
+      canvas.style.height = `${{height}}px`;
+
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("width", String(width));
+      svg.setAttribute("height", String(height));
+
+      const pointFor = (nodeId) => ({{
+        x: paddingX + xByNode.get(nodeId) * horizontalGap + nodeWidth / 2,
+        y: paddingY + depthByNode.get(nodeId) * verticalGap + nodeHeight / 2,
+      }});
+
+      for (const [parentId, children] of childrenByParent.entries()) {{
+        if (!seen.has(parentId)) continue;
+        const parentPoint = pointFor(parentId);
+        children.forEach((childId) => {{
+          if (!seen.has(childId)) return;
+          const childPoint = pointFor(childId);
+          const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+          const midY = parentPoint.y + (childPoint.y - parentPoint.y) / 2;
+          path.classList.add("tree-edge");
+          path.setAttribute("d", `M ${{parentPoint.x}} ${{parentPoint.y + nodeHeight / 2}} V ${{midY}} H ${{childPoint.x}} V ${{childPoint.y - nodeHeight / 2}}`);
+          svg.append(path);
+        }});
+      }}
+      canvas.append(svg);
+
+      calls.forEach((item) => {{
+        if (!seen.has(item.id)) return;
+        const point = pointFor(item.id);
+        const wrap = document.createElement("div");
+        wrap.className = "call-tree-node-wrap";
+        wrap.style.left = `${{point.x - nodeWidth / 2}}px`;
+        wrap.style.top = `${{point.y - nodeHeight / 2}}px`;
+        const node = document.createElement("div");
+        node.className = "call-node" + (item.id === state.active_call_id ? " active" : "") + (item.status === "done" ? " done" : "");
+        node.textContent = item.label;
+        wrap.append(node);
+        canvas.append(wrap);
+      }});
+
+      treePanel.append(canvas);
       return true;
     }}
 
