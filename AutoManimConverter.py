@@ -1704,7 +1704,7 @@ class AutoManimConverter:
       valueColorMap.clear();
       (choicesData || []).forEach(colorForValue);
 
-      if (!decisions.length && renderCallTreePanel(state)) {{
+      if (renderCallTreePanel(state)) {{
         renderBinaryTreePanel(state, true);
         renderCollectionPanel(state, true);
         renderTablePanel(state, true);
@@ -2435,6 +2435,6 @@ if __name__ == "__main__":
         (snippets_dir / "solution.js").read_text(encoding="utf-8"),
     ])
 
-    converter = AutoManimConverter(js_code, "solution", [[6,2,8,0,4,7,9,'null','null',3,5], 3, 5])
-    viewer = converter.generate_interactive_viewer("lca")
+    converter = AutoManimConverter(js_code, "solution", [[3,4,5],9])
+    viewer = converter.generate_interactive_viewer("subset_sum")
     print(f"Interactive viewer: {viewer}")
