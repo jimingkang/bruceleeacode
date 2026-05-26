@@ -441,7 +441,7 @@ app.innerHTML = `
           <div class="stream-panel-title">Streaming</div>
           <pre id="streamContent"></pre>
         </section>
-        <section class="ai-chat-panel" aria-label="Talk to Ollama">
+        <section class="ai-chat-panel" aria-label="Talk to Ollama" hidden>
           <textarea id="aiChatInput" rows="3" spellcheck="false" placeholder="Ask Ollama about this solution..."></textarea>
           <button id="aiChatSendButton" type="button">Send</button>
         </section>
@@ -1016,35 +1016,35 @@ function buildDeepSeekPrompt(problem: Problem): string {
   ].join('\n');
 }
 
-async function sendAiChatMessage() {
-  const message = aiChatInput.value.trim();
-  if (!message) {
-    return;
-  }
-
-  aiChatSendButton.disabled = true;
-  showStreamingOutput('');
-
-  try {
-    const context = [
-      'User question:',
-      message,
-      '',
-      'Current code:',
-      editor.getValue(),
-      '',
-      'Current function arguments:',
-      argsInput.value,
-    ].join('\n');
-
-    await streamOllamaChat(context);
-    aiChatInput.value = '';
-  } catch (error) {
-    showStreamingOutput(error instanceof Error ? error.message : String(error));
-  } finally {
-    aiChatSendButton.disabled = false;
-  }
-}
+// async function sendAiChatMessage() {
+//   const message = aiChatInput.value.trim();
+//   if (!message) {
+//     return;
+//   }
+//
+//   aiChatSendButton.disabled = true;
+//   showStreamingOutput('');
+//
+//   try {
+//     const context = [
+//       'User question:',
+//       message,
+//       '',
+//       'Current code:',
+//       editor.getValue(),
+//       '',
+//       'Current function arguments:',
+//       argsInput.value,
+//     ].join('\n');
+//
+//     await streamOllamaChat(context);
+//     aiChatInput.value = '';
+//   } catch (error) {
+//     showStreamingOutput(error instanceof Error ? error.message : String(error));
+//   } finally {
+//     aiChatSendButton.disabled = false;
+//   }
+// }
 
 async function streamOllamaChat(prompt: string) {
   const response = await fetch('/api/chat', {
@@ -1839,16 +1839,16 @@ stopButton.addEventListener('click', () => {
   setRunState('idle');
 });
 
-aiChatSendButton.addEventListener('click', () => {
-  void sendAiChatMessage();
-});
-
-aiChatInput.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-    event.preventDefault();
-    void sendAiChatMessage();
-  }
-});
+// aiChatSendButton.addEventListener('click', () => {
+//   void sendAiChatMessage();
+// });
+//
+// aiChatInput.addEventListener('keydown', (event) => {
+//   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+//     event.preventDefault();
+//     void sendAiChatMessage();
+//   }
+// });
 
 function stepToNextLine() {
   resumeMode = 'step';

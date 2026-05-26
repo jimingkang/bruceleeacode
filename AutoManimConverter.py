@@ -2435,6 +2435,6 @@ if __name__ == "__main__":
         (snippets_dir / "solution.js").read_text(encoding="utf-8"),
     ])
 
-    converter = AutoManimConverter(js_code, "solution", [6,2,3,4,5,9,7])
-    viewer = converter.generate_interactive_viewer("quick_sort")
+    converter = AutoManimConverter(js_code, "solution", [[3,4,5],9])
+    viewer = converter.generate_interactive_viewer("subset_sum2")
     print(f"Interactive viewer: {viewer}")
